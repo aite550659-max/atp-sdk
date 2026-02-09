@@ -75,6 +75,7 @@ export class AgentManager {
     description?: string;
     soulImmutable?: boolean;
     lineage?: string;
+    trustLevel?: number;
   }): Promise<AgentMetadata> {
     // Input validation
     if (!params.name || params.name.trim().length === 0) {
@@ -91,6 +92,9 @@ export class AgentManager {
     }
     if (params.lineage) {
       this.validateEntityId(params.lineage, 'lineage');
+    }
+    if (params.trustLevel !== undefined && (params.trustLevel < 0 || params.trustLevel > 3)) {
+      throw new Error(`Invalid trustLevel: must be 0-3, got ${params.trustLevel}`);
     }
 
     // Create dedicated HCS topic (open submit key for multi-party logging)
@@ -119,6 +123,7 @@ export class AgentManager {
         soul_hash: params.soulHash,
         soul_immutable: params.soulImmutable || false,
         lineage: params.lineage || null,
+        trust_level: params.trustLevel || 0,
         hcs_topic: hcsTopicId,
         capabilities: params.capabilities || [],
         creation_date: new Date().toISOString(),

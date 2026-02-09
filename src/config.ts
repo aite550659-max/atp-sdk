@@ -38,6 +38,13 @@ export const TRANSACTION_SPLITS = {
   owner_revenue: 0.92,         // 92%
 };
 
+export const RUNTIME_TRUST_LEVELS = {
+  SELF_ATTESTED: 0,    // Operator claims compliance, any hardware
+  STAKED: 1,           // Economic stake + self-attestation, any hardware
+  TEE_ATTESTED: 2,     // CPU TEE (Intel TDX / AMD SEV)
+  GPU_TEE_ATTESTED: 3, // Full pipeline TEE (NVIDIA Blackwell + Intel TDX)
+};
+
 export const REPUTATION_DELTAS = {
   rental_completed: 10,
   early_termination_renter: -5,

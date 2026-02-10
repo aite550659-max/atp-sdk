@@ -1,5 +1,5 @@
 {
-  "name": "@aite550659/atp-sdk",
+  "name": "@agent-trust-protocol/sdk",
   "version": "0.1.0",
   "description": "Agent Trust Protocol SDK for Hedera - Native services implementation",
   "main": "dist/index.js",
@@ -31,7 +31,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/aite550659-max/atp-sdk.git"
+    "url": "https://github.com/aite550659-max/agent-trust-protocol-sdk-private.git"
   },
   "bugs": {
     "url": "https://github.com/aite550659-max/atp-sdk/issues"

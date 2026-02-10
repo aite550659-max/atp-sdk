@@ -144,6 +144,7 @@ export class HCSLogger {
       'rental_downtime',
       'rental_completed',
       'rental_terminated',
+      'rental_timeout',
       'rental_violation',
       // Sub-rental
       'subrental_initiated',

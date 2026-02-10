@@ -55,7 +55,11 @@ export interface Rental {
   constraints: RentalConstraints;
   startedAt: string;
   endedAt?: string;
-  status: 'active' | 'completed' | 'terminated' | 'disputed';
+  status: 'active' | 'completed' | 'terminated' | 'disputed' | 'timed_out';
+  /** ISO timestamp when escrow timeout expires (renter can claim refund after this) */
+  timeoutAt?: string;
+  /** ISO timestamp when secondary settlement window expires (owner can still settle) */
+  settlementDeadline?: string;
 }
 
 export interface ReputationScore {

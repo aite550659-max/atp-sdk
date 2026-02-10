@@ -72,8 +72,8 @@ export class RentalStore {
     return Array.from(this.rentals.values());
   }
 
-  /** Mark a rental as completed/terminated and archive it */
-  complete(rentalId: string, status: 'completed' | 'terminated' = 'completed'): void {
+  /** Mark a rental as completed/terminated/timed_out and archive it */
+  complete(rentalId: string, status: 'completed' | 'terminated' | 'timed_out' = 'completed'): void {
     const rental = this.rentals.get(rentalId);
     if (rental) {
       rental.status = status;

@@ -24,6 +24,19 @@ function toTinybars(hbar: number): number {
   return Math.round(hbar * 1e8);
 }
 
+/** Grace periods by rental type (milliseconds) */
+const TIMEOUT_GRACE_MS: Record<string, number> = {
+  flash: 15 * 60 * 1000,       // 15 minutes
+  session: 60 * 60 * 1000,     // 1 hour
+  term: 24 * 60 * 60 * 1000,   // 24 hours
+};
+
+/** Secondary settlement window after timeout (owner can still settle) */
+const SETTLEMENT_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+/** Dead escrow cleanup window (either party can trigger full refund) */
+const DEAD_ESCROW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 export class RentalManager {
   private hcsLogger: HCSLogger;
   private indexer: Indexer;
@@ -183,6 +196,13 @@ export class RentalManager {
 
     await this.hcsLogger.log(initiationMessage, agent.hcsTopicId);
 
+    // Calculate timeout based on rental type + expected duration + grace period
+    const now = Date.now();
+    const expectedDurationMs = (params.expectedDurationMinutes || 0) * 60 * 1000;
+    const graceMs = TIMEOUT_GRACE_MS[params.type] || TIMEOUT_GRACE_MS.session;
+    const timeoutMs = now + expectedDurationMs + graceMs;
+    const settlementDeadlineMs = timeoutMs + SETTLEMENT_WINDOW_MS;
+
     // Return rental object
     const rental: Rental = {
       rentalId,
@@ -213,6 +233,8 @@ export class RentalManager {
       },
       startedAt: new Date().toISOString(),
       status: 'active',
+      timeoutAt: new Date(timeoutMs).toISOString(),
+      settlementDeadline: new Date(settlementDeadlineMs).toISOString(),
     };
 
     // Persist rental (including escrow key) to disk immediately
@@ -508,5 +530,166 @@ export class RentalManager {
 
     // Mark rental completed in persistent store (removes escrow key)
     this.store.complete(rentalId, 'completed');
+  }
+
+  /**
+   * Claim timeout refund as renter.
+   * After the timeout window expires and no settlement has occurred,
+   * the renter can reclaim their full escrow (stake + buffer).
+   * Treasury/network fees are still deducted (they facilitated the attempt).
+   *
+   * @param rentalId - The timed-out rental
+   * @throws Error if not timed out, caller is not renter, or already settled
+   */
+  async claimTimeout(rentalId: string): Promise<void> {
+    const rental = await this.getStatus(rentalId);
+
+    if (rental.status !== 'active') {
+      throw new Error(`Rental ${rentalId} is not active (status: ${rental.status})`);
+    }
+    if (rental.renter !== this.config.operatorId) {
+      throw new Error(`Only the renter can claim timeout refund (renter: ${rental.renter}, caller: ${this.config.operatorId})`);
+    }
+    if (!rental.timeoutAt) {
+      throw new Error(`Rental ${rentalId} has no timeout configured`);
+    }
+
+    const now = Date.now();
+    const timeoutAt = new Date(rental.timeoutAt).getTime();
+
+    if (now < timeoutAt) {
+      const remainingMin = Math.ceil((timeoutAt - now) / 60000);
+      throw new Error(`Rental ${rentalId} has not timed out yet (${remainingMin} minutes remaining)`);
+    }
+
+    const escrowKey = rental.escrowKey;
+    if (!escrowKey) {
+      throw new Error(`No escrow key for rental ${rentalId} — cannot claim timeout`);
+    }
+
+    const agent = await this.resolveAgent(rental.agentId);
+    const hbarRate = await exchangeRateService.getRate();
+
+    // Minimal fee: just treasury + network (they facilitated the attempt)
+    const minimalFeeUsd = rental.usageBufferUsd * (TRANSACTION_SPLITS.atp_treasury + TRANSACTION_SPLITS.network_contribution);
+    const totalEscrowHbar = rental.stakeHbar + rental.usageBufferHbar;
+
+    const networkTb = toTinybars((minimalFeeUsd * TRANSACTION_SPLITS.network_contribution / (TRANSACTION_SPLITS.atp_treasury + TRANSACTION_SPLITS.network_contribution)) / hbarRate);
+    const treasuryTb = toTinybars((minimalFeeUsd * TRANSACTION_SPLITS.atp_treasury / (TRANSACTION_SPLITS.atp_treasury + TRANSACTION_SPLITS.network_contribution)) / hbarRate);
+    const totalEscrowTb = toTinybars(totalEscrowHbar);
+    const renterRefundTb = totalEscrowTb - networkTb - treasuryTb;
+
+    const networkAccount = NETWORK_ACCOUNTS[this.config.network].network;
+    const treasuryAccount = NETWORK_ACCOUNTS[this.config.network].treasury;
+    const escrowPrivateKey = PrivateKey.fromStringED25519(escrowKey);
+
+    const refundTx = new TransferTransaction()
+      .addHbarTransfer(AccountId.fromString(rental.escrowAccount), Hbar.fromTinybars(-totalEscrowTb))
+      .addHbarTransfer(AccountId.fromString(networkAccount), Hbar.fromTinybars(networkTb))
+      .addHbarTransfer(AccountId.fromString(treasuryAccount), Hbar.fromTinybars(treasuryTb))
+      .addHbarTransfer(AccountId.fromString(rental.renter), Hbar.fromTinybars(renterRefundTb))
+      .freezeWith(this.client);
+
+    await refundTx.sign(escrowPrivateKey);
+    const refundResponse = await refundTx.execute(this.client);
+    const refundReceipt = await refundResponse.getReceipt(this.client);
+
+    if (refundReceipt.status !== Status.Success) {
+      throw new Error(`Timeout refund failed for rental ${rentalId}: ${refundReceipt.status}`);
+    }
+
+    // Log to HCS
+    const timeoutMessage = this.hcsLogger.createMessage(
+      'rental_timeout',
+      rental.agentId,
+      {
+        rental_id: rentalId,
+        claimed_by: 'renter',
+        renter: rental.renter,
+        owner: rental.owner,
+        timeout_at: rental.timeoutAt,
+        claimed_at: new Date().toISOString(),
+        duration_minutes: Math.round((Date.now() - new Date(rental.startedAt).getTime()) / 60000),
+        refund_hbar: renterRefundTb / 1e8,
+        network_fee_hbar: networkTb / 1e8,
+        treasury_fee_hbar: treasuryTb / 1e8,
+        transaction_id: refundResponse.transactionId.toString(),
+      }
+    );
+
+    await this.hcsLogger.log(timeoutMessage, agent.hcsTopicId);
+    this.store.complete(rentalId, 'timed_out');
+  }
+
+  /**
+   * Owner settles a timed-out rental with usage proof.
+   * Available during the secondary settlement window (timeout + 24h).
+   * If the rental actually happened but complete() was missed, the owner
+   * can still claim revenue with valid usage data.
+   *
+   * @param rentalId - The rental to settle
+   * @param usage - Actual usage data (same as complete())
+   * @throws Error if outside settlement window, caller is not owner, or already settled
+   */
+  async settleTimeout(rentalId: string, usage: {
+    totalInstructions: number;
+    totalTokens: number;
+    totalCostUsd: number;
+    uptimePercentage?: number;
+  }): Promise<void> {
+    const rental = await this.getStatus(rentalId);
+
+    if (rental.status !== 'active') {
+      throw new Error(`Rental ${rentalId} is not active (status: ${rental.status})`);
+    }
+    if (rental.owner !== this.config.operatorId) {
+      throw new Error(`Only the owner can settle a timeout (owner: ${rental.owner}, caller: ${this.config.operatorId})`);
+    }
+    if (!rental.timeoutAt || !rental.settlementDeadline) {
+      throw new Error(`Rental ${rentalId} has no timeout/settlement deadline configured`);
+    }
+
+    const now = Date.now();
+    const timeoutAt = new Date(rental.timeoutAt).getTime();
+    const deadline = new Date(rental.settlementDeadline).getTime();
+
+    if (now < timeoutAt) {
+      throw new Error(`Rental ${rentalId} has not timed out yet — use complete() instead`);
+    }
+    if (now > deadline) {
+      throw new Error(`Settlement deadline has passed for rental ${rentalId} — renter should use claimTimeout()`);
+    }
+
+    // Delegate to standard complete() — same settlement logic applies
+    await this.complete(rentalId, usage);
+  }
+
+  /**
+   * Check all active rentals for timeouts and return expired ones.
+   * Useful for periodic cleanup (heartbeat, cron).
+   *
+   * @returns Array of rentals that have passed their timeout
+   */
+  getTimedOutRentals(): StoredRental[] {
+    const now = Date.now();
+    return this.store.getActive().filter(rental => {
+      if (!rental.timeoutAt) return false;
+      return now > new Date(rental.timeoutAt).getTime();
+    });
+  }
+
+  /**
+   * Check for dead escrows (past 7-day cleanup window).
+   * Either party can trigger full refund to renter.
+   *
+   * @returns Array of rentals past the dead escrow window
+   */
+  getDeadEscrows(): StoredRental[] {
+    const now = Date.now();
+    return this.store.getActive().filter(rental => {
+      if (!rental.timeoutAt) return false;
+      const deadlineMs = new Date(rental.timeoutAt).getTime() + DEAD_ESCROW_MS;
+      return now > deadlineMs;
+    });
   }
 }

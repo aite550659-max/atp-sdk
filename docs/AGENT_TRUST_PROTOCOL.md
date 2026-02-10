@@ -381,13 +381,13 @@ Day 0:  Guardian submits recovery_initiated to agent's HCS topic
         - Includes: new_owner_address, guardian_signature, reason
         - Agent status changes to "recovery_pending"
 
-Day 1-30: Challenge period
+Day 1-90: Challenge period (Basic tier; see 1.8.3 for other tiers)
         - Original owner can cancel recovery by signing a challenge
         - Any active rental completes normally
         - No new rentals during recovery period
         - Recovery event is visible on HCS (public, auditable)
 
-Day 30: If unchallenged, guardian executes NFT transfer
+Day 90: If unchallenged, guardian executes NFT transfer
         - NFT moves to new_owner_address
         - recovery_completed logged to HCS
         - Agent resumes normal commercial operation
@@ -433,11 +433,11 @@ Day 30: If unchallenged, guardian executes NFT transfer
 
 | Tier | Guardian Type | Challenge Period | Use Case |
 |------|--------------|-----------------|----------|
-| **Basic** | Single address | 30 days | Individual owners |
-| **Multi-sig** | 2-of-3 addresses | 14 days | Teams, organizations |
-| **Institutional** | Smart contract with governance | 7 days | High-value agents, DAOs |
+| **Basic** | Single address | 90 days | Individual owners |
+| **Multi-sig** | 2-of-3 addresses | 60 days | Teams, organizations |
+| **Institutional** | Smart contract with governance | 30 days | High-value agents, DAOs |
 
-Shorter challenge periods are earned through stronger guardian configurations. A 2-of-3 multi-sig provides enough security to justify faster recovery.
+Shorter challenge periods are earned through stronger guardian configurations. A 2-of-3 multi-sig reduces risk of a single malicious actor, justifying faster recovery. Even the shortest tier (30 days) gives meaningful time to respond.
 
 #### 1.8.4 Phase 1 Recovery (No NFT)
 
@@ -452,7 +452,7 @@ This is less catastrophic than NFT loss because Phase 1 has no economic layer at
 
 #### 1.8.5 Design Rationale
 
-- **30-day challenge period** balances recovery speed with security against malicious guardians
+- **90-day challenge period (basic)** gives owners real time to notice and respond, even if offline for weeks
 - **Guardian cannot receive revenue** prevents incentive to trigger false recoveries
 - **Public HCS logging** ensures all recovery attempts are visible and auditable
 - **Challenge mechanism** means a lost key that's later found can still cancel recovery

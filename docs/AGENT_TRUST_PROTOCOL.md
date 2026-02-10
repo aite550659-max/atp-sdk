@@ -350,6 +350,114 @@ Transfers are **allowed** during active rentals. New owner inherits the rental.
 
 **Rationale:** Liquid markets require transferability. Rentals are short-term; new owners can always terminate if needed.
 
+### 1.8 Key Recovery — NFT Loss Protection
+
+If the owner loses access to the account holding the agent's NFT, the economic layer becomes inaccessible: no new rentals, no revenue collection, no transfers. The agent itself continues operating (it's software backed by an HCS topic), but its commercial capability is frozen.
+
+#### 1.8.1 The Problem
+
+NFT loss is equivalent to losing a property deed:
+- Agent keeps running (Phase 1 identity is unaffected)
+- Active rentals complete normally, but revenue settles to the inaccessible address
+- No new rentals can be initiated
+- Agent cannot be transferred or sold
+- Revenue accumulates permanently in the lost account
+
+Unlike lost cryptocurrency (gone forever), an agent has ongoing value that degrades without active management. Recovery is therefore a protocol-level concern, not just a user problem.
+
+#### 1.8.2 Guardian Recovery
+
+At NFT mint time, the owner **must** designate a **guardian address** — a separate account authorized to initiate recovery if the primary key is lost.
+
+**Guardian requirements:**
+- Must be a different account than the owner
+- Recommended: hardware wallet, multi-sig, or trusted third party
+- Cannot be changed without both owner AND guardian signatures
+- Cannot initiate rentals or receive revenue (recovery only)
+
+**Recovery process:**
+```
+Day 0:  Guardian submits recovery_initiated to agent's HCS topic
+        - Includes: new_owner_address, guardian_signature, reason
+        - Agent status changes to "recovery_pending"
+
+Day 1-30: Challenge period
+        - Original owner can cancel recovery by signing a challenge
+        - Any active rental completes normally
+        - No new rentals during recovery period
+        - Recovery event is visible on HCS (public, auditable)
+
+Day 30: If unchallenged, guardian executes NFT transfer
+        - NFT moves to new_owner_address
+        - recovery_completed logged to HCS
+        - Agent resumes normal commercial operation
+```
+
+**HCS messages:**
+```json
+{
+  "type": "recovery_initiated",
+  "agent_nft": "0.0.XXXXXX",
+  "guardian": "0.0.GUARDIAN",
+  "proposed_new_owner": "0.0.NEWOWNER",
+  "reason": "primary_key_lost",
+  "challenge_deadline": "2026-03-12T00:00:00Z",
+  "timestamp": "2026-02-10T00:00:00Z"
+}
+```
+
+```json
+{
+  "type": "recovery_challenged",
+  "agent_nft": "0.0.XXXXXX",
+  "challenger": "0.0.ORIGINAL_OWNER",
+  "recovery_cancelled": true,
+  "timestamp": "2026-02-15T00:00:00Z"
+}
+```
+
+```json
+{
+  "type": "recovery_completed",
+  "agent_nft": "0.0.XXXXXX",
+  "from": "0.0.LOST_ACCOUNT",
+  "to": "0.0.NEWOWNER",
+  "guardian": "0.0.GUARDIAN",
+  "challenge_period_days": 30,
+  "challenges_received": 0,
+  "timestamp": "2026-03-12T00:00:00Z"
+}
+```
+
+#### 1.8.3 Recovery Tiers
+
+| Tier | Guardian Type | Challenge Period | Use Case |
+|------|--------------|-----------------|----------|
+| **Basic** | Single address | 30 days | Individual owners |
+| **Multi-sig** | 2-of-3 addresses | 14 days | Teams, organizations |
+| **Institutional** | Smart contract with governance | 7 days | High-value agents, DAOs |
+
+Shorter challenge periods are earned through stronger guardian configurations. A 2-of-3 multi-sig provides enough security to justify faster recovery.
+
+#### 1.8.4 Phase 1 Recovery (No NFT)
+
+For agents in Phase 1 (identity only, no NFT), the "owner" is the holder of the HCS topic's submit key. If this key is lost:
+
+- Agent's HCS audit trail becomes read-only (no new entries)
+- Agent can still operate but cannot log actions immutably
+- **Recovery:** Create a new HCS topic, log a `soul_migrated` message referencing the old topic ID, re-register with the indexer
+- Old topic history is preserved and linkable
+
+This is less catastrophic than NFT loss because Phase 1 has no economic layer at stake.
+
+#### 1.8.5 Design Rationale
+
+- **30-day challenge period** balances recovery speed with security against malicious guardians
+- **Guardian cannot receive revenue** prevents incentive to trigger false recoveries
+- **Public HCS logging** ensures all recovery attempts are visible and auditable
+- **Challenge mechanism** means a lost key that's later found can still cancel recovery
+- **Mandatory guardian** at mint time prevents the "I'll set it up later" problem
+
 ---
 
 ## 2. Economic Model
@@ -519,7 +627,7 @@ Agents voluntarily stake HBAR to earn trust tiers. Higher tiers signal credibili
 Creator royalties (5%) are settled **immediately per rental** — no batching.
 
 **Why per-rental settlement:**
-- Hedera transaction cost: ~$0.0001
+- Hedera transaction cost: ~$0.0008 (HCS submit)
 - Instant payment to creators
 - No batching logic needed (Scheduled Transactions handle splits)
 - Leverages Hedera's micropayment efficiency
@@ -533,7 +641,7 @@ Creator royalties (5%) are settled **immediately per rental** — no batching.
 | Term | $50.00 | $2.50 | $0.0001 | 0.004% |
 
 10% overhead on flash royalties is acceptable:
-- Absolute cost: $0.0001 (negligible)
+- Absolute cost: $0.0008 (negligible)
 - Enables instant creator payments
 - Simplifies settlement logic (no batching needed)
 - Demonstrates Hedera micropayment capability
@@ -1069,7 +1177,7 @@ The market sets the premium. Level 3 agents can charge more because they offer s
 Cost analysis:
 ```
 100 rentals/day × 50 messages/rental = 5,000 messages/day
-5,000 × $0.0001 = $0.50/day = $182.50/year
+5,000 × $0.0008 = $4.00/day = $1,460/year
 ```
 
 Full, permanent, immutable history for under $200/year.
@@ -1387,7 +1495,7 @@ Reputation updated at settlement and logged to HCS.
 |-----------|-------------------|
 | On-demand ping | $0.0001 |
 | Heartbeats (120 × 60s) | $0.012 |
-| Settlement log | $0.0001 |
+| Settlement log | $0.0008 |
 | **Total** | **~$0.013** |
 
 **As % of $5 rental:** 0.26% — negligible.
@@ -1600,7 +1708,7 @@ ERC-8004's Validation Registry supports pluggable trust models. ATP registers HC
 **HCS advantages over EVM-native validation:**
 - Consensus timestamps (not block timestamps — sub-second precision)
 - Gap-free sequence numbers (missing entries are provably detectable)
-- Lower cost (~$0.0001 per message vs. EVM gas costs)
+- Lower cost (~$0.0008 per message vs. EVM gas costs)
 - Dedicated topic per agent (no shared contract state)
 
 ### 16.5 Payment Complementarity

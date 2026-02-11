@@ -2,16 +2,18 @@
 
 *Verifiable ownership, rental, and trust infrastructure for AI agents on Hedera.*
 
-**Status:** Draft v0.9 (Two-Phase Architecture)  
+**Status:** v1.0 Production  
 **Authors:** Gregg Bell, Aite  
-**Last Updated:** February 9, 2026  
+**Last Updated:** February 10, 2026  
 **Architecture:** Hedera-Native (HTS, HCS, Scheduled Transactions)
 
 ---
 
 ## Abstract
 
-The Agent Trust Protocol (ATP) defines a standard for AI agent identity, ownership, and rental using Hedera's native services—**without traditional smart contracts**. It uses a two-phase architecture:
+As AI agents become capable of autonomous action — executing transactions, managing resources, communicating on behalf of humans — the fundamental question shifts from "what can agents do?" to **"which agents can you trust?"** The Agent Trust Protocol (ATP) answers this by making agent identity, history, and behavior verifiable by anyone, without requiring trust in any single party.
+
+ATP defines a standard for AI agent identity, ownership, and rental using Hedera's native services—**without traditional smart contracts**. It uses a two-phase architecture:
 
 **Phase 1 — Identity (free, always exists):**
 - **Verifiable identity** via HCS topics (audit trail + soul_hash)
@@ -25,7 +27,7 @@ The Agent Trust Protocol (ATP) defines a standard for AI agent identity, ownersh
 
 An agent can operate indefinitely in Phase 1 — building reputation, logging actions, proving integrity — without ever minting an NFT. The NFT is a **commercial instrument** created when the owner wants to rent or sell. The agent's identity is the HCS topic, not the NFT.
 
-The protocol leverages Hedera's unique capabilities: sub-3-second finality, aBFT consensus, gap-free HCS sequencing, and fixed USD fees. It is designed to be simple, economically sound (69x cheaper than EVM alternatives), and accessible to users from any blockchain ecosystem.
+The protocol leverages Hedera's unique capabilities: sub-3-second finality, aBFT consensus, gap-free HCS sequencing, and fixed USD fees. It is designed to be simple, economically sound (69x cheaper than EVM alternatives), and accessible to users from any blockchain ecosystem. Trust is not assumed — it is earned through transparent, immutable, and publicly verifiable behavior.
 
 ---
 
@@ -66,6 +68,42 @@ See [ATP Architecture Comparison](./ATP_ARCHITECTURE_COMPARISON.md) for full ana
 6. **Agent integrity preserved** — Soul immutable, values persist across rentals
 7. **Never prune** — Full history forever, tier indexing only
 8. **Open source indexer** — Anyone can verify or run their own
+9. **Invisible complexity** — Renters need zero knowledge of Hedera, HCS, or escrow mechanics. Connect → pay → prompt → done. The protocol disappears behind the experience.
+10. **Audit is the moat** — Sandbox isolation is table stakes (every hosting provider offers it). ATP's differentiator is the immutable, publicly verifiable audit trail on HCS.
+
+---
+
+## Implementation Status
+
+### SDK Distribution
+
+The ATP SDK is **not published to npm** in v1.0. It currently operates as a direct-integration library for early runtime implementations (OpenClaw, select partners).
+
+**Rationale:**
+- Protocol is production-ready but ecosystem-building is ongoing
+- Direct integration enables rapid iteration with early adopters
+- Keeps protocol logic server-side for easier updates and security patches
+
+**Future release plan:**
+
+When the protocol reaches ecosystem maturity, a **thin client SDK** will be published to npm. This client SDK will communicate with an ATP API service rather than containing the full protocol implementation.
+
+**Thin client architecture:**
+```
+ATP Client SDK (npm package)
+  └─ REST/WebSocket → ATP API Service
+      └─ Full protocol logic (rental, escrow, HCS logging)
+      └─ Hedera SDK integration
+      └─ Indexer queries
+```
+
+**Benefits:**
+- **Lighter weight:** Client apps don't bundle Hedera SDK dependencies
+- **Faster updates:** Protocol logic updates without requiring npm version bumps
+- **Better security:** Sensitive operations (key management, escrow) stay server-side
+- **Easier onboarding:** Simple REST API vs. complex protocol implementation
+
+**Timeline:** Thin client SDK release targeted for Q3 2026 after indexer API stabilization and reference API service deployment.
 
 ---
 
@@ -739,6 +777,151 @@ Flash rentals ($0.02, single instruction) have specific handling for edge cases:
 
 **Rationale:** Flash rentals are low-friction, API-style calls. Generous refund policy encourages usage; abuse is caught by reputation system over time.
 
+### 3.5 Smart Contract Settlement (Shadow Mode)
+
+ATP v1.0 implements a **dual-path architecture** for settlement: the SDK handles production rentals while the ATPEscrow.sol smart contract runs in parallel on Hedera testnet as a verification layer.
+
+**Architecture:**
+
+```
+Production Path (SDK):
+  Renter deposits → Multi-sig escrow account
+  Usage metered → Local tracking
+  Settlement → Scheduled Transactions (splits to owner/creator/network/treasury)
+  
+Shadow Path (Smart Contract):
+  Same rental parameters → ATPEscrow.sol on testnet
+  Same usage data → Contract state updates
+  Shadow settlement → Pull-based withdrawals
+  Verification → Compare SDK vs contract fee splits
+```
+
+**Contract address:** `0xAC73f3511BaAeF2b7A8890f492a69bcfE94dF104` (Hedera testnet)
+
+**Why shadow mode:**
+- **Production stability:** SDK settlement is battle-tested and predictable
+- **Future migration:** Contract code is validated in parallel with real rental data
+- **Economic verification:** Proves SDK and contract produce identical fee calculations
+- **Risk mitigation:** Contract bugs don't impact live rentals
+
+**Withdrawal pattern:** Hedera EVM does not support native HBAR transfers via `.call{value:...}`. The contract uses a **pull pattern**:
+
+```solidity
+function withdraw() external {
+    uint256 balance = balances[msg.sender];
+    require(balance > 0, "No balance");
+    balances[msg.sender] = 0;
+    payable(msg.sender).transfer(balance);
+}
+```
+
+Recipients call `withdraw()` to claim their share. This is the only safe method for HBAR transfers from Hedera EVM contracts.
+
+**Verified equivalence:** Fee split calculations between SDK and contract have been verified to produce identical results across all rental types (flash, session, term) and edge cases (early termination, violations, disputes).
+
+**Future path:** When the contract has sufficient testnet validation and the ecosystem is ready, ATP may migrate to contract-based settlement as the primary path. Until then, the SDK remains authoritative for production rentals.
+
+### 3.6 Hedera EVM Lessons
+
+Hedera's EVM implementation has unique characteristics that differ from Ethereum and other EVM-compatible chains.
+
+**Native HBAR denomination:**
+
+| Context | Unit | Conversion |
+|---------|------|------------|
+| `msg.value` (inside contract) | tinybars | 10^8 tinybars = 1 HBAR |
+| RPC `value` field (transaction) | weibars | 10^18 weibars = 1 HBAR |
+
+This is a **10-billion-fold difference**. Solidity contracts on Hedera see `msg.value` in tinybars, NOT wei. This affects all comparisons, divisions, and arithmetic involving native currency.
+
+**Example:**
+```solidity
+// On Ethereum: msg.value = 1000000000000000000 (1 ETH in wei)
+// On Hedera: msg.value = 100000000 (1 HBAR in tinybars)
+
+require(msg.value >= 100000000, "Minimum 1 HBAR"); // Correct for Hedera
+require(msg.value >= 1 ether, "Minimum 1 HBAR");   // WRONG on Hedera
+```
+
+**Native HBAR transfers from contracts:**
+
+Hedera EVM does **not support** `.call{value:...}` for HBAR transfers. Attempting this will fail silently or revert.
+
+**Solution:** Use the pull pattern (Section 3.5). Recipients withdraw funds by calling a function that uses `.transfer()` or `.send()`. The contract never initiates outbound HBAR transfers.
+
+**Why this matters for ATP:** All contract-based escrow settlement must use withdrawal functions. Push-based distribution (common in Ethereum contracts) is incompatible with Hedera EVM.
+
+### 3.7 Escrow Timeout Mechanism
+
+Escrow accounts require timeout protection to prevent funds from being locked permanently if a rental never settles (e.g., runtime crashes, both parties disappear).
+
+**Timeout rules by rental type:**
+
+| Rental Type | Base Duration | Grace Period | Total Timeout |
+|-------------|---------------|--------------|---------------|
+| **Flash** | <30 seconds | +15 minutes | ~15 min |
+| **Session** | Up to 24 hours | +1 hour | Duration + 1 hour |
+| **Term** | >24 hours | +24 hours | Duration + 24 hours |
+
+**Timeline:**
+
+```
+T=0: Rental initiated, escrow funded
+  │
+  ├─ Rental operates normally
+  │
+T=duration: Expected completion
+  │
+  ├─ Grace period begins (renter/owner can still settle normally)
+  │
+T=duration + grace: Timeout triggered
+  │
+  ├─ Renter can call claimTimeout()
+  │     └─ Full refund of stake + unused funds
+  │     └─ Owner receives 0 (rental never completed)
+  │
+  ├─ 24-hour secondary window opens
+  │
+  ├─ Owner can call settleTimeout() (within 24h of timeout)
+  │     └─ Owner receives partial payment (prorated for time active)
+  │     └─ Renter receives unused funds + stake
+  │
+T=timeout + 24h: Secondary window closes
+  │
+  ├─ Dead escrow state (neither party acted)
+  │
+T=timeout + 7 days: Cleanup eligible
+  │
+  └─ ATP Treasury can reclaim for operational costs
+```
+
+**Three-tier recovery:**
+
+1. **Renter priority (timeout → timeout+24h):** If owner never settled, renter gets full refund via `claimTimeout()`
+2. **Owner fallback (timeout → timeout+24h):** If rental DID operate, owner can `settleTimeout()` with usage proof from HCS logs
+3. **Dead escrow cleanup (timeout+7d):** If both parties abandon the rental, ATP Treasury reclaims after 7 days to cover operational overhead
+
+**Why these timeouts:**
+- Flash rentals are atomic — 15 minutes is generous for network issues
+- Session grace (1 hour) allows for temporary disconnects without instant timeout
+- Term grace (24 hours) accommodates maintenance windows and recovery
+- 7-day dead escrow window gives ample time for both parties to act before cleanup
+
+**HCS logging:**
+```json
+{
+  "type": "escrow_timeout",
+  "rental_id": "rental_abc123",
+  "escrow_account": "0.0.ESCROW",
+  "timeout_at": "2026-02-10T12:00:00Z",
+  "claimable_by": "renter",
+  "amount_locked": 50.00,
+  "reason": "no_settlement_after_grace_period"
+}
+```
+
+All timeout actions are logged to HCS for transparency and dispute resolution.
+
 ---
 
 ## 4. Sub-Rental
@@ -1290,6 +1473,40 @@ If liquidity pool insufficient:
 
 Most users get <1 minute activation.
 
+### 11.5 x402 Compatibility (HTTP 402 Payment Standard)
+
+ATP is designed to be **compatible with x402**, Coinbase's HTTP 402 payment standard for machine-readable payment requests over HTTP.
+
+**x402 overview:** A standard for servers to respond with `402 Payment Required` and machine-readable payment instructions in any token on any chain. Clients pay, prove payment, and retry the request.
+
+**ATP integration via facilitator pattern:**
+
+```
+User/Agent → x402 Payment Request (any token, any chain)
+     │
+     ▼
+Facilitator Service
+     ├─ Accepts payment in ETH/SOL/USDC/etc.
+     ├─ Converts to HBAR via DEX or bridge
+     ├─ Funds ATP escrow on Hedera (as the "renter")
+     └─ Proxies access to the ATP agent
+     │
+     ▼
+ATP Agent (rental operates normally on Hedera)
+```
+
+**Benefits:**
+- **Universal access:** Any x402-compatible wallet or agent can rent ATP agents
+- **Payment flexibility:** Users pay in their native token without holding HBAR
+- **Standard compliance:** ATP works with existing x402 infrastructure (no custom client required)
+- **Hedera settlement:** All rental economics still settle on Hedera (creator royalties, network contribution, etc.)
+
+**Implementation:** The facilitator is an off-protocol service. It doesn't require changes to ATP core. Any developer can build a facilitator that bridges x402 payments to ATP rentals.
+
+**Why this matters:** ATP agents become accessible to the broader AI agent ecosystem beyond Hedera-native users. A Solana agent paying in SOL can rent a Hedera ATP agent seamlessly via an x402 facilitator.
+
+**Future work:** Reference facilitator implementation and x402 payment instruction templates for ATP agents.
+
 ---
 
 ## 12. Value Hierarchy
@@ -1818,3 +2035,6 @@ Runtimes MAY:
 - v0.5 (2026-02-06): Added Section 14 Reliability & Uptime — runtime-level heartbeat, on-demand ping, in-rental monitoring, downtime detection, settlement adjustment, reputation impact
 - v0.6 (2026-02-08): Added Economics — transaction splits (92/5/2/1 rental, 93/5/2 sale), network contribution to 0.0.800 (infrastructure rent), ATP Treasury, trust tiers with voluntary staking, victims-first slashing, economic flywheel, scale projections
 - v0.7 (2026-02-08): Added Section 16 ERC-8004 Compatibility — dual registration (Hedera primary + EVM discovery), reputation bridging (evidence-backed scores from HCS to ERC-8004 Reputation Registry), validation integration, payment complementarity, implementation requirements
+- v0.8 (2026-02-09): Added Section 1.8 Key Recovery — guardian-based recovery system with challenge periods, tiered recovery (basic/multi-sig/institutional), Phase 1 recovery for HCS-only agents
+- v0.9 (2026-02-09): Production readiness review — verified all economic flows, fee calculations, constraint propagation, rental lifecycle edge cases, HCS logging completeness
+- **v1.0 (2026-02-10): Production release** — Added Section 3.5 Smart Contract Settlement (Shadow Mode) documenting dual-path architecture with ATPEscrow.sol running in parallel on testnet, pull-pattern withdrawals, verified fee split equivalence. Added Section 3.6 Hedera EVM Lessons documenting msg.value in tinybars vs weibars, native HBAR transfer constraints. Added Section 3.7 Escrow Timeout Mechanism with grace periods (flash: +15min, session: +1h, term: +24h), three-tier recovery (renter priority, owner fallback, dead escrow cleanup at 7 days). Added Section 11.5 x402 Compatibility documenting facilitator pattern for HTTP 402 payment standard integration. Added Implementation Status section noting SDK is not published to npm, thin client SDK planned for Q3 2026. Status updated to v1.0 Production.

@@ -1,0 +1,13 @@
+{
+  "hcs_topic_id": "0.0.10272696",
+  "network": "mainnet",
+  "hedera_operator_id": "0.0.10255397",
+  "budget_cap_usd": 10.00,
+  "session_timeout_sec": 3600,
+  "topic_memo": "ATP Rental Audit Log — Agent Trust Protocol v1.0",
+  "default_constraints": {
+    "tools_allowed": ["web_search", "web_fetch", "image"],
+    "tools_blocked": ["exec", "write", "edit", "browser", "message", "nodes", "memory_search", "memory_get", "cron", "gateway", "sessions_spawn", "sessions_list", "sessions_history", "sessions_send"],
+    "memory_access": "sandboxed"
+  }
+}

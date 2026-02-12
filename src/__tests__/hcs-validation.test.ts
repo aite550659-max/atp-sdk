@@ -17,8 +17,6 @@ const validMessageTypes = [
   'rental_downtime', 'rental_completed', 'rental_terminated', 'rental_violation',
   'subrental_initiated',
   'dispute_filed', 'dispute_assigned', 'dispute_resolved',
-  'reputation_snapshot',
-  'trust_tier_staked', 'trust_tier_unstaked',
   'runtime_attestation',
 ];
 

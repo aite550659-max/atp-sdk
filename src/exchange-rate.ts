@@ -209,7 +209,7 @@ export class ExchangeRateService {
    * 
    * @example
    * ```typescript
-   * import { exchangeRateService } from '@hashgraph/atp-sdk';
+   * import { exchangeRateService } from '@agent-trust-protocol/sdk';
    * 
    * // Set deterministic rate for testing
    * exchangeRateService.setTestRate(0.10);

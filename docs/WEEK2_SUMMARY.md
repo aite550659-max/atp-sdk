@@ -103,7 +103,7 @@
 
 ## What's Working
 
-### SDK (`@hashgraph/atp-sdk`)
+### SDK (`@agent-trust-protocol/sdk`)
 ✅ Agent creation (HTS NFT + HCS topic + metadata)  
 ✅ Rental initiation (escrow + transfers + logging)  
 ✅ Rental completion (settlement + splits + logging)  

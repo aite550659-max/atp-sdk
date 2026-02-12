@@ -1,5 +1,5 @@
 /**
- * @hashgraph/atp-sdk
+ * @agent-trust-protocol/sdk
  * Agent Trust Protocol SDK for Hedera (Native Services)
  * 
  * Architecture: Hedera-native (HTS, HCS, Scheduled Transactions)

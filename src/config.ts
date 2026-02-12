@@ -38,28 +38,17 @@ export const TRANSACTION_SPLITS = {
   owner_revenue: 0.92,         // 92%
 };
 
+// Runtime trust levels (TEE attestation) — kept for future use.
+// These describe hardware verification capabilities, not access gates.
 export const RUNTIME_TRUST_LEVELS = {
   SELF_ATTESTED: 0,    // Operator claims compliance, any hardware
-  STAKED: 1,           // Economic stake + self-attestation, any hardware
-  TEE_ATTESTED: 2,     // CPU TEE (Intel TDX / AMD SEV)
-  GPU_TEE_ATTESTED: 3, // Full pipeline TEE (NVIDIA Blackwell + Intel TDX)
+  TEE_ATTESTED: 1,     // CPU TEE (Intel TDX / AMD SEV)
+  GPU_TEE_ATTESTED: 2, // Full pipeline TEE (NVIDIA Blackwell + Intel TDX)
 };
 
-export const REPUTATION_DELTAS = {
-  rental_completed: 10,
-  early_termination_renter: -5,
-  early_termination_owner: 0,
-  violation: -20,
-  stake_slashed: -50,
-  dispute_won: 5,
-  dispute_lost: -30,
-  arbiter_overturned: -100,
-};
+// Reputation deltas removed in v1 — reputation system deferred.
+// Audit trail is the reputation. Review HCS history to assess an agent.
 
-export const TRUST_TIERS = [
-  { tier: 0, name: 'unverified', minStake: 0 },
-  { tier: 1, name: 'basic', minStake: 100 },
-  { tier: 2, name: 'verified', minStake: 1000 },
-  { tier: 3, name: 'professional', minStake: 10000 },
-  { tier: 4, name: 'enterprise', minStake: 100000 },
-];
+// Trust tiers removed in v1 — anyone can create, anyone can rent.
+// Trust comes from the HCS audit trail, not gatekeeping.
+// Tiers may return in v2 if economic staking proves valuable.

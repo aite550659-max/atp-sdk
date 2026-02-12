@@ -152,11 +152,6 @@ export class HCSLogger {
       'dispute_filed',
       'dispute_assigned',
       'dispute_resolved',
-      // Reputation
-      'reputation_snapshot',
-      // Trust & staking
-      'trust_tier_staked',
-      'trust_tier_unstaked',
       // Runtime
       'runtime_attestation',
     ];

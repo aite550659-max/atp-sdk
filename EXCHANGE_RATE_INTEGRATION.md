@@ -30,7 +30,7 @@ Added real-time HBAR/USD exchange rate service to ATP SDK with test mode support
 
 ### Test Mode
 ```typescript
-import { exchangeRateService } from '@hashgraph/atp-sdk';
+import { exchangeRateService } from '@agent-trust-protocol/sdk';
 
 // Set deterministic rate for testing
 exchangeRateService.setTestRate(0.10); // $0.10 per HBAR
@@ -43,7 +43,7 @@ exchangeRateService.clearTestRate();
 
 ### Production Use
 ```typescript
-import { ATPClient } from '@hashgraph/atp-sdk';
+import { ATPClient } from '@agent-trust-protocol/sdk';
 
 const atp = new ATPClient({ /* config */ });
 
@@ -77,7 +77,7 @@ cd ~/atp-sdk && npx ts-node test-exchange-rate.ts
 
 ### Get Current Rate
 ```typescript
-import { exchangeRateService } from '@hashgraph/atp-sdk';
+import { exchangeRateService } from '@agent-trust-protocol/sdk';
 
 const rate = await exchangeRateService.getRate();
 console.log(`HBAR: $${rate.toFixed(4)}`);
@@ -160,7 +160,7 @@ const stakeHbar = params.stakeUsd / hbarRate;
 ### Test Suite Updates
 ```typescript
 // At beginning of test suite
-import { exchangeRateService } from '@hashgraph/atp-sdk';
+import { exchangeRateService } from '@agent-trust-protocol/sdk';
 
 exchangeRateService.setTestRate(0.10); // Deterministic for tests
 

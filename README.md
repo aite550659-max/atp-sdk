@@ -1,180 +1,92 @@
-# @hashgraph/atp-sdk
+# Agent Trust Protocol (ATP)
 
-**Agent Trust Protocol SDK for Hedera (Native Services)**
+⚠️ **Alpha — Actively under development. Expect breaking changes.**
 
-A TypeScript SDK for building, renting, and managing AI agents using the Agent Trust Protocol (ATP) on Hedera.
+## What is ATP?
+
+ATP is a standalone standard for verifiable AI agent ownership, rental economics, and trust. It defines how agents are created, rented, monitored, and held accountable without requiring smart contracts.
+
+## Status
+
+**What works:**
+- Agent creation (HTS NFT with 5% royalty)
+- Rental lifecycle (flash/session/term)
+- HCS audit logging (topic: [0.0.10261370](https://hashscan.io/mainnet/topic/0.0.10261370))
+- Reputation computation from HCS events
+- Dispute filing and resolution
+- Testnet validation: **7/7 mainnet tests**, **31/32 integration tests**
+
+**In progress:**
+- SDK bindings (TypeScript complete, Python/Go in development)
+- Indexer performance optimization
+- Documentation expansion
+- Production hardening
 
 ## Architecture
 
-ATP uses **Hedera-native services** (HTS, HCS, Scheduled Transactions) instead of traditional smart contracts. This provides:
+ATP uses **Hedera-native services** (HTS, HCS, Scheduled Transactions) instead of smart contracts:
 
+- **HCS** (Consensus Service) — immutable audit trail for every action
+- **HTS** (Token Service) — agents as NFTs with royalty splits
+- **HBAR** — native payment rails for rentals and disputes
+
+**Benefits:**
 - **69x cheaper** per-rental overhead ($0.0005 vs $0.035)
 - **600x higher** theoretical TPS (10,000 vs 15)
 - **Simpler security** model (no contract vulnerabilities)
 - **Full transparency** via immutable HCS audit trails
 
-See [ATP Architecture Comparison](https://github.com/hashgraph/atp-sdk/blob/main/docs/ATP_ARCHITECTURE_COMPARISON.md) for details.
-
-## Installation
-
-```bash
-npm install @hashgraph/atp-sdk
-```
-
 ## Quick Start
 
-```typescript
-import { ATPClient } from '@hashgraph/atp-sdk';
+```bash
+npm install @agent-trust-protocol/sdk
+```
 
-// Initialize client
+```typescript
+import { ATPClient } from '@agent-trust-protocol/sdk';
+
 const atp = new ATPClient({
   network: 'testnet',
   operatorId: '0.0.12345',
-  operatorKey: 'your-private-key',
-  indexerUrl: 'https://atp-indexer-testnet.hedera.com'
+  operatorKey: 'your-private-key'
 });
 
 // Create an agent
 const agent = await atp.agents.create({
   name: 'MyAgent',
   soulHash: 'sha256:abc123...',
-  manifestUri: 'ipfs://Qm...',
-  pricing: {
-    flashBaseFee: 0.02,
-    standardBaseFee: 5.00,
-    perInstruction: 0.05,
-    perMinute: 0.01,
-    llmMarkupBps: 150,
-    toolMarkupBps: 150
-  }
+  pricing: { flashBaseFee: 0.02, standardBaseFee: 5.00 }
 });
 
-// Rent an agent
+// Rent it
 const rental = await atp.rentals.initiate({
   agentId: agent.agentId,
   type: 'session',
-  stake: 50.00,
-  buffer: 100.00,
-  constraints: {
-    toolsBlocked: ['wallet'],
-    memoryAccessLevel: 'sandboxed',
-    topicsBlocked: [],
-    maxPerInstructionCost: 10.00,
-    maxDailyCost: 100.00
-  }
-});
-
-// Check rental status
-const status = await atp.rentals.getStatus(rental.rentalId);
-
-// Complete rental
-await atp.rentals.complete(rental.rentalId, {
-  totalInstructions: 12,
-  totalTokens: 24000,
-  totalCost: 8.50
+  stake: 50.00
 });
 ```
 
-## Features
+## Contribute
 
-### Agent Management
-- Create agents (HTS NFT with 5% royalty)
-- Update pricing
-- Transfer ownership
-- Query metadata
+**The codebase is being built. It may have errors. Help us make it better.**
 
-### Rental Lifecycle
-- Initiate rentals (flash/session/term)
-- Execute instructions with constraints
-- Heartbeat monitoring
-- Settlement with automatic splits
+Every contribution is recognized — PRs, issues, reviews, docs. All significant contributions are attested on-chain via HCS to topic [0.0.10261370](https://hashscan.io/mainnet/topic/0.0.10261370). This means your work is **permanently, publicly, verifiably recorded** on Hedera's immutable ledger.
 
-### Reputation System
-- Computed from HCS events
-- Portable across all ATP agents
-- Query via indexer or compute directly
+Contribute because you believe in verifiable AI agents. The rest will follow.
 
-### Dispute Resolution
-- File disputes with challenger-funded stakes
-- Arbiter selection via VRF
-- Evidence-based rulings
-- Automatic compensation distribution
-
-### HCS Audit Trail
-- Every action logged to HCS
-- Gap-free sequencing
-- Consensus timestamps
-- Publicly verifiable
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for details.
 
 ## Documentation
 
 - [Getting Started](./docs/getting-started.md)
 - [API Reference](./docs/api-reference.md)
-- [HCS Message Schema](./docs/ATP_HCS_SCHEMA_V2.md)
-- [Architecture Comparison](./docs/ATP_ARCHITECTURE_COMPARISON.md)
 - [Examples](./examples/)
-
-## Requirements
-
-- Node.js >= 18
-- Hedera account with HBAR balance
-- ATP indexer URL (or run your own)
-
-## Development
-
-```bash
-# Install dependencies
-npm install
-
-# Build
-npm run build
-
-# Test
-npm test
-
-# Lint
-npm run lint
-```
-
-## Architecture
-
-```
-@hashgraph/atp-sdk
-├── src/
-│   ├── client.ts          # Main ATP client
-│   ├── managers/
-│   │   ├── agent.ts       # Agent creation & management
-│   │   ├── rental.ts      # Rental lifecycle
-│   │   ├── reputation.ts  # Reputation queries
-│   │   └── dispute.ts     # Dispute filing & resolution
-│   ├── hcs/
-│   │   └── logger.ts      # HCS message submission
-│   ├── indexer/
-│   │   └── client.ts      # Indexer REST API client
-│   ├── types.ts           # TypeScript interfaces
-│   └── config.ts          # Constants & defaults
-├── examples/              # Usage examples
-├── test/                  # Test suite
-└── docs/                  # Documentation
-```
-
-## Contributing
-
-Contributions welcome! Please see [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## License
 
-Apache-2.0
-
-## Links
-
-- [ATP Specification](https://github.com/hashgraph/atp-spec)
-- [Hedera Hashgraph](https://hedera.com)
-- [HCS Documentation](https://docs.hedera.com/hedera/sdks-and-apis/sdks/consensus-service)
-- [HTS Documentation](https://docs.hedera.com/hedera/sdks-and-apis/sdks/token-service)
+Apache 2.0 — Copyright 2026 Gregory L. Bell
 
 ---
 
 **Built by:** Gregg Bell ([@GregoryLBell](https://x.com/GregoryLBell)), Aite ([@TExplorer59](https://x.com/TExplorer59))  
-**Status:** Alpha (v0.1.0)  
 **Architecture:** Hedera-Native (no smart contracts)

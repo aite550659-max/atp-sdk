@@ -43,11 +43,14 @@ const DAEMON_MODE = process.argv.includes('--daemon');
 const POLL_INTERVAL = 15_000; // 15 seconds
 const MIN_DEPOSIT_USD = 1.00; // Minimum $1 deposit
 
-// Pricing tiers
-const TIERS = {
-  standard: { name: 'Standard', priceUsd: 1.50, durationMin: 60, tools: ['web_search', 'web_fetch', 'image'] },
-  creator:  { name: 'Creator',  priceUsd: 5.00, durationMin: 60, tools: ['web_search', 'web_fetch', 'image', 'exec', 'write'] },
+// Full-capability rentals; initial model inherits current Aite runtime unless changed later
+const MODEL_CHOICES = {
+  haiku:  { name: 'Haiku' },
+  sonnet: { name: 'Sonnet' },
+  opus:   { name: 'Opus' },
 };
+const DEFAULT_MODEL = 'inherit_current';
+const FULL_CAPABILITIES = ['web_search', 'web_fetch', 'image', 'exec', 'write'];
 
 // ── State ───────────────────────────────────────────────────────────────────
 
@@ -58,7 +61,7 @@ function loadState() {
     return {
       lastTimestamp: '0',  // Hedera consensus timestamp (seconds.nanoseconds)
       processedTxIds: [],     // Last 100 processed transaction IDs
-      pendingDeposits: {},    // memo → { renterName, telegramChatId, tier, timestamp }
+      pendingDeposits: {},    // memo → { renterName, telegramChatId, model, timestamp }
       activatedRentals: [],   // History of activated rentals
       stats: { totalDeposits: 0, totalUsd: 0 }
     };
@@ -158,13 +161,13 @@ function parseMemo(memoBase64) {
   if (!memoBase64) return null;
   try {
     const decoded = Buffer.from(memoBase64, 'base64').toString('utf8');
-    // Expected format: rent-<username> or rent-<username>-<tier>
+    // Expected format: rent-<username> or legacy rent-<username>-<model>
     const match = decoded.match(/^rent-(\S+?)(?:-(\w+))?$/i);
     if (!match) return null;
     return {
       raw: decoded,
       username: match[1],
-      tier: match[2] || 'standard'
+      model: match[2] ? match[2].toLowerCase() : DEFAULT_MODEL
     };
   } catch { return null; }
 }
@@ -196,14 +199,15 @@ async function processTransaction(tx, state) {
   const depositHbar = credit.amount / 100_000_000;
   const depositUsd = hbarToUsd(credit.amount, rate);
   const renterName = memo?.username || sender.account;
-  const tier = TIERS[memo?.tier] || TIERS.standard;
+  const modelPreference = MODEL_CHOICES[memo?.model] ? memo.model : DEFAULT_MODEL;
+  const modelInfo = MODEL_CHOICES[modelPreference] || { name: 'inherit current Aite model' };
 
   console.log(`  💰 Deposit detected!`);
   console.log(`     From: ${sender.account}`);
   console.log(`     Amount: ${depositHbar.toFixed(4)} HBAR ($${depositUsd.toFixed(2)})`);
   console.log(`     Memo: ${memo ? memo.raw : '(none — using sender account as ID)'}`);
   console.log(`     Renter: ${renterName}`);
-  console.log(`     Tier: ${tier.name}`);
+  console.log(`     Initial model mode: ${modelInfo.name}`);
   console.log(`     Rate: $${rate}/HBAR`);
 
   // Validate minimum deposit
@@ -213,23 +217,26 @@ async function processTransaction(tx, state) {
     return null;
   }
 
-  // Determine budget cap (deposit amount in USD)
+  // Deposit amount becomes the session budget cap
   const budgetCap = depositUsd;
-  const durationMin = tier.durationMin;
+  const durationMin = 60;
 
   const deposit = {
     txId,
     timestamp: tx.consensus_timestamp,
     sender: sender.account,
     renter: renterName,
-    tier: memo?.tier || 'standard',
-    tierName: tier.name,
+    modelPreference,
+    currentModel: modelPreference === 'inherit_current' ? 'inherit_current' : modelPreference,
+    modelName: modelInfo.name,
     depositHbar,
     depositUsd: parseFloat(depositUsd.toFixed(4)),
     budgetCapUsd: parseFloat(budgetCap.toFixed(4)),
     durationMin,
     hbarUsdRate: rate,
-    tools: tier.tools,
+    tools: FULL_CAPABILITIES,
+    status: 'active',
+    expiresAt: Date.now() + (durationMin * 60 * 1000),
     processedAt: new Date().toISOString()
   };
 
@@ -253,12 +260,13 @@ async function activateRental(deposit, state) {
         renterId: deposit.sender,
         renterName: deposit.renter,
         budgetCap: deposit.budgetCapUsd,
-        tier: deposit.tierName,
+        tier: 'full-capabilities',
         depositTx: deposit.txId,
         depositHbar: deposit.depositHbar,
         depositUsd: deposit.depositUsd,
         hbarRate: deposit.hbarUsdRate,
-        tools: deposit.tools
+        tools: deposit.tools,
+        modelPreference: deposit.modelPreference
       })
     });
     const data = await res.json();
@@ -279,7 +287,7 @@ async function activateRental(deposit, state) {
   const RENTAL_SESSION_KEY = process.env.RENTAL_SESSION_KEY || 'agent:atp-rental:telegram:group:-5273529238';
   const GATEWAY_PORT = process.env.OPENCLAW_GATEWAY_PORT || '18789';
   const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || 'e35d238c2262bfb2aeec929bc72b4b2b28255772af135e6d';
-  const activationMsg = `🎉 NEW RENTAL ACTIVATED — User ${deposit.renter} has paid ${deposit.depositHbar.toFixed(2)} HBAR ($${deposit.depositUsd.toFixed(2)} USD). Tier: ${deposit.tierName}. Budget cap: $${deposit.budgetCapUsd.toFixed(2)}. Rental session is now ACTIVE. Greet the renter and let them know you're ready to help.`;
+  const activationMsg = `🎉 NEW RENTAL ACTIVATED — User ${deposit.renter} has paid ${deposit.depositHbar.toFixed(2)} HBAR ($${deposit.depositUsd.toFixed(2)} USD). Full capabilities enabled. Initial model behavior: inherit Aite's current model at activation. Budget cap: $${deposit.budgetCapUsd.toFixed(2)}. The renter can change models during the session. Rental session is now ACTIVE. Greet the renter and let them know you're ready to help.`;
   try {
     const wsModule = await import('ws');
     const WebSocket = wsModule.WebSocket || wsModule.default;

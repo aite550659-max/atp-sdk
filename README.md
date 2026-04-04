@@ -81,6 +81,22 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for details.
 - [Getting Started](./docs/getting-started.md)
 - [API Reference](./docs/api-reference.md)
 - [Examples](./examples/)
+- [ATP HCS Schema v2.1](./docs/ATP_HCS_SCHEMA_V2.1.md)
+
+## Experimental Runtime Tooling
+
+To avoid losing active ATP runtime work while the TypeScript SDK core catches up, this repo now includes an experimental rental logger reference implementation:
+
+- `examples/runtime/atp-rental-logger.mjs`
+- `examples/runtime/atp-rental-logger.test.mjs`
+
+This runtime/logger path is intentionally staged as reference tooling first. It is ahead of the current TS SDK core and will be integrated more cleanly into the package architecture later.
+
+Run the lightweight tests with:
+
+```bash
+node --test examples/runtime/atp-rental-logger.test.mjs
+```
 
 ## License
 

@@ -26,6 +26,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
+import { getFundingIntentByMemo, updateFundingIntent } from './funding-store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, 'deposit-state.json');
@@ -189,6 +190,7 @@ async function processTransaction(tx, state) {
 
   // Parse memo (optional — no-memo deposits are now accepted)
   const memo = parseMemo(tx.memo_base64);
+  const fundingIntent = memo?.raw ? getFundingIntentByMemo(memo.raw) : null;
 
   // Get sender
   const sender = transfers.find(t => t.amount < 0 && t.account !== DEPOSIT_ACCOUNT);
@@ -198,8 +200,9 @@ async function processTransaction(tx, state) {
   const rate = await getHbarUsdRate();
   const depositHbar = credit.amount / 100_000_000;
   const depositUsd = hbarToUsd(credit.amount, rate);
-  const renterName = memo?.username || sender.account;
-  const modelPreference = MODEL_CHOICES[memo?.model] ? memo.model : DEFAULT_MODEL;
+  const renterName = fundingIntent?.renterName || memo?.username || sender.account;
+  const preferredModel = fundingIntent?.modelPreference || memo?.model;
+  const modelPreference = MODEL_CHOICES[preferredModel] ? preferredModel : DEFAULT_MODEL;
   const modelInfo = MODEL_CHOICES[modelPreference] || { name: 'inherit current Aite model' };
 
   console.log(`  💰 Deposit detected!`);
@@ -237,7 +240,10 @@ async function processTransaction(tx, state) {
     tools: FULL_CAPABILITIES,
     status: 'active',
     expiresAt: Date.now() + (durationMin * 60 * 1000),
-    processedAt: new Date().toISOString()
+    processedAt: new Date().toISOString(),
+    fundingIntentId: fundingIntent?.intentId || null,
+    fundingMemo: memo?.raw || null,
+    telegramChatId: fundingIntent?.renterTelegramChatId || null
   };
 
   state.stats.totalDeposits++;
@@ -250,6 +256,19 @@ async function processTransaction(tx, state) {
 
 async function activateRental(deposit, state) {
   console.log(`  🚀 Activating rental for ${deposit.renter}...`);
+
+  if (deposit.fundingIntentId) {
+    updateFundingIntent(deposit.fundingIntentId, {
+      status: 'payment_detected',
+      metadata: {
+        depositTxId: deposit.txId,
+        depositHbar: deposit.depositHbar,
+        depositUsd: deposit.depositUsd,
+        sender: deposit.sender
+      }
+    }, 'payment_detected');
+    updateFundingIntent(deposit.fundingIntentId, { status: 'activating' }, 'activating_rental');
+  }
 
   // Notify monitor to spin up container
   try {
@@ -382,6 +401,20 @@ async function activateRental(deposit, state) {
   state.processedTxIds.push(deposit.txId);
   state.activatedRentals.push(deposit);
   saveState(state);
+
+  if (deposit.fundingIntentId) {
+    updateFundingIntent(deposit.fundingIntentId, {
+      status: 'active',
+      activatedAt: new Date().toISOString(),
+      metadata: {
+        rentalId: deposit.rentalId || null,
+        containerName: deposit.containerName || null,
+        depositTxId: deposit.txId,
+        depositUsd: deposit.depositUsd,
+        depositHbar: deposit.depositHbar
+      }
+    }, 'rental_active');
+  }
 
   // Start HCS sidecar loop to log interactions on-chain
   startSidecarLoop();

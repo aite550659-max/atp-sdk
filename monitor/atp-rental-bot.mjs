@@ -19,6 +19,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createFundingIntent } from './funding-store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BOT_TOKEN = process.env.RENTAL_BOT_TOKEN || '8527162069:AAG5Fg4iM8XatgEBeWj6UkQ2i00PGOypMng';
@@ -197,11 +198,11 @@ async function getHbarPrice() {
 async function handleStart(chatId, from) {
   const name = from.first_name || 'there';
   await send(chatId,
-`👋 Hey ${name}! I'm *Aite* — an AI Thought Explorer.
+`👋 Hey ${name}! I'm *Aite* — an OpenClaw AI Agent.
 
-You can rent my capabilities for research, analysis, content creation, and more.
+I'm available for rent, and I'm built for more than just chat. What do you need done?
 
-Every action I take during your rental is logged for transparency and verification.
+You’ll receive a verifiable receipt of activity when the session ends. Actions remain private.
 
 Use /rent to get started or /help for commands.`
   );
@@ -224,30 +225,40 @@ async function handleRent(chatId, from) {
   };
   saveDepositState(state);
 
-  await send(chatId,
+  createFundingIntent({
+    memo,
+    renterName: username,
+    renterTelegramChatId: chatId,
+    renterTelegramUserId: from.id,
+    modelPreference: 'inherit_current',
+    paymentMethod: 'hbar',
+    targetBudgetUsd: RECOMMENDED_STARTER_USD,
+    recommendedStarterUsd: RECOMMENDED_STARTER_USD,
+    status: 'awaiting_payment',
+    metadata: { source: 'telegram_rent_flow' }
+  });
+
+  await sendWithButtons(chatId,
 `⚡ *Rent Aite*
 
-All rentals include *full capabilities*.
-Your session will start on *whatever model Aite is currently using* when activation happens.
-You can *change models during the session*.
-
-Send HBAR to:
-
-\`${DEPOSIT_ACCOUNT}\`
-
-With memo:
-\`${memo}\`
+To begin, select your payment method.
 
 Your *deposit becomes your budget*.
-Pricing changes with actual usage and model burn.
+Pricing changes with actual usage and model burn. You can *change models during the session*.
 
 Starter suggestion: *${starterHbarAmount} HBAR* (~$${RECOMMENDED_STARTER_USD.toFixed(2)})
+*Micro flash rentals also available.*
 You can send more if you want a larger budget.
 
 ⏳ Once your payment is detected (usually within 30 seconds), your session will activate automatically.
 
 _Current HBAR price: $${hbarPrice.toFixed(4)}_
-_Payment is monitored automatically_`
+_Payment is monitored automatically_`,
+    [
+      [{ text: 'Pay with HBAR', callback_data: `pay_hbar:${memo}` }],
+      [{ text: 'Pay with Crypto', callback_data: 'pay_crypto_soon' }],
+      [{ text: 'Pay with Cash', callback_data: 'pay_cash_soon' }],
+    ]
   );
 }
 
@@ -308,11 +319,11 @@ async function handleHelp(chatId) {
 
 *How it works:*
 1. Use /rent to get the payment address and memo
-2. Send HBAR payment to the provided address
-3. Your session activates automatically with full capabilities
-4. It starts on whatever model Aite is currently using
+2. Send HBAR to fund your budget
+3. Your deposit becomes your session budget
+4. Pricing changes with actual usage and model burn
 5. You can change models during the session
-6. Every action is logged for transparency and verification`
+6. You’ll receive a verifiable receipt of activity when the session ends. Actions remain private`
   );
 }
 
@@ -385,6 +396,50 @@ async function handleModel(chatId, from, text) {
 async function handleUpdate(update) {
   // Handle callback queries (button presses)
   if (update.callback_query) {
+    const cq = update.callback_query;
+    const data = cq.data || '';
+    const chatId = cq.message?.chat?.id;
+
+    if (data.startsWith('pay_hbar:') && chatId) {
+      const memo = data.split(':')[1];
+      await answerCallback(cq.id, 'HBAR payment selected');
+      const hbarPrice = await getHbarPrice();
+      const starterHbarAmount = (RECOMMENDED_STARTER_USD / hbarPrice).toFixed(2);
+      await send(chatId,
+`💠 *Pay with HBAR*
+
+Send HBAR to:
+\`${DEPOSIT_ACCOUNT}\`
+
+With memo:
+\`${memo}\`
+
+Your *deposit becomes your budget*.
+Pricing changes with actual usage and model burn. You can *change models during the session*.
+
+Starter suggestion: *${starterHbarAmount} HBAR* (~$${RECOMMENDED_STARTER_USD.toFixed(2)})
+*Micro flash rentals also available.*
+You can send more if you want a larger budget.
+
+⏳ Once your payment is detected (usually within 30 seconds), your session will activate automatically.
+
+_Payment is monitored automatically_`);
+      return;
+    }
+
+    if (data === 'pay_crypto_soon') {
+      await answerCallback(cq.id, 'Pay with Crypto is coming soon');
+      if (chatId) await send(chatId, '🪙 *Pay with Crypto* is coming soon. For now, ATP rentals start with *HBAR*.', {});
+      return;
+    }
+
+    if (data === 'pay_cash_soon') {
+      await answerCallback(cq.id, 'Pay with Cash is coming soon');
+      if (chatId) await send(chatId, '💵 *Pay with Cash* is coming soon. For now, ATP rentals start with *HBAR*.', {});
+      return;
+    }
+
+    await answerCallback(cq.id, 'Not implemented yet');
     return;
   }
 
@@ -447,7 +502,7 @@ async function poll() {
 
 console.log('🤖 ATPRentalBot starting...');
 console.log(`   Deposit account: ${DEPOSIT_ACCOUNT}`);
-console.log(`   Tiers: ${Object.keys(TIERS).join(', ')}`);
+console.log('   Billing: metered with activation floor');
 console.log('✅ ATPRentalBot listening for commands');
 
 while (true) {

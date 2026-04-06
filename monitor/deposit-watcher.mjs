@@ -26,7 +26,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
-import { getFundingIntentByMemo, updateFundingIntent } from './funding-store.mjs';
+import { getFundingIntentByMemo, listFundingIntents, updateFundingIntent } from './funding-store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, 'deposit-state.json');
@@ -34,12 +34,16 @@ const MIRROR_API = 'https://mainnet.mirrornode.hedera.com/api/v1';
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-const DEPOSIT_ACCOUNT = process.env.DEPOSIT_ACCOUNT || '0.0.10255397';
+const DEPOSIT_ACCOUNT = process.env.DEPOSIT_ACCOUNT || '0.0.10421318';
 // Use @ATPRentalBot for activation messages — separate from the owner bot
 // so the gateway processes them as real incoming messages (not self-messages)
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const RENTAL_BOT_TOKEN = process.env.RENTAL_BOT_TOKEN || '8527162069:AAG5Fg4iM8XatgEBeWj6UkQ2i00PGOypMng';
 const MONITOR_URL = process.env.MONITOR_URL || 'http://localhost:3500';
+const RELAY_URL = process.env.VAL_RELAY_URL || 'http://localhost:3141';
+const BASE_RPC_URL = process.env.BASE_RPC_URL || 'https://mainnet.base.org';
+const ATP_EVM_HOT_WALLET = process.env.ATP_EVM_HOT_WALLET || '0x0868eC02bb536c24694123ec1c2066Af6Ba6D620';
+const BASE_USDC_ADDRESS = '0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913';
 const DAEMON_MODE = process.argv.includes('--daemon');
 const POLL_INTERVAL = 15_000; // 15 seconds
 const MIN_DEPOSIT_USD = 1.00; // Minimum $1 deposit
@@ -52,6 +56,18 @@ const MODEL_CHOICES = {
 };
 const DEFAULT_MODEL = 'inherit_current';
 const FULL_CAPABILITIES = ['web_search', 'web_fetch', 'image', 'exec', 'write'];
+
+function getGatewayToken() {
+  if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
+  if (process.env.GATEWAY_TOKEN) return process.env.GATEWAY_TOKEN;
+  try {
+    const configPath = path.join(process.env.HOME || '', '.openclaw', 'openclaw.json');
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    return config?.gateway?.auth?.token || null;
+  } catch {
+    return null;
+  }
+}
 
 // ── State ───────────────────────────────────────────────────────────────────
 
@@ -137,6 +153,191 @@ async function getRecentTransactions(afterTimestamp) {
   }
 }
 
+async function getSwapStatus(swapId) {
+  const url = new URL(`${RELAY_URL}/v1/swap/status`);
+  url.searchParams.set('id', swapId);
+  const res = await fetch(url);
+  const data = await res.json();
+  if (!res.ok || data.error) throw new Error(data.error || `swap status failed for ${swapId}`);
+  return data;
+}
+
+async function processNonHbarFunding(state) {
+  const intents = listFundingIntents(intent =>
+    ['crypto', 'cash'].includes(intent.paymentMethod) &&
+    ['awaiting_payment', 'payment_detected', 'converting'].includes(intent.status) &&
+    intent.metadata?.swapId
+  );
+
+  for (const intent of intents) {
+    const swapId = intent.metadata?.swapId;
+    const syntheticTxId = `swap:${swapId}`;
+    if (!swapId || state.processedTxIds.includes(syntheticTxId)) continue;
+
+    try {
+      const swap = await getSwapStatus(swapId);
+      const swapStatus = swap.status || 'waiting';
+
+      if (['confirming', 'exchanging', 'sending'].includes(swapStatus) && intent.status !== 'converting') {
+        updateFundingIntent(intent.intentId, {
+          status: 'converting',
+          metadata: { swapStatus }
+        }, `swap_${swapStatus}`);
+
+        if (swapStatus === 'confirming') {
+          await sendTelegram(
+            intent.renterTelegramChatId,
+            '⏳ Payment detected / confirming.'
+          );
+        }
+      }
+
+      if (swap.finished) {
+        const rate = await getHbarUsdRate();
+        const depositHbar = Number(swap.amountReceived || intent.metadata?.estimatedHbar || 0);
+        const depositUsd = depositHbar * rate;
+        const deposit = {
+          txId: syntheticTxId,
+          timestamp: swap.updatedAt || new Date().toISOString(),
+          sender: `${intent.sourceAsset || 'crypto'}:${intent.sourceChain || 'external'}`,
+          renter: intent.renterName,
+          modelPreference: intent.modelPreference || DEFAULT_MODEL,
+          currentModel: intent.modelPreference || DEFAULT_MODEL,
+          modelName: MODEL_CHOICES[intent.modelPreference || DEFAULT_MODEL]?.name || 'inherit current Aite model',
+          depositHbar,
+          depositUsd: parseFloat(depositUsd.toFixed(4)),
+          budgetCapUsd: parseFloat(depositUsd.toFixed(4)),
+          durationMin: 60,
+          hbarUsdRate: rate,
+          tools: FULL_CAPABILITIES,
+          status: 'active',
+          expiresAt: Date.now() + (60 * 60 * 1000),
+          processedAt: new Date().toISOString(),
+          fundingIntentId: intent.intentId,
+          fundingMemo: intent.memo || null,
+          telegramChatId: intent.renterTelegramChatId || null
+        };
+
+        await activateRental(deposit, state);
+        continue;
+      }
+
+      if (swap.failed) {
+        updateFundingIntent(intent.intentId, {
+          status: 'failed',
+          failedAt: new Date().toISOString(),
+          failureReason: swapStatus,
+          metadata: { swapStatus }
+        }, `swap_${swapStatus}`);
+      }
+    } catch (e) {
+      console.error(`Swap status error (${swapId}): ${e.message}`);
+    }
+  }
+}
+
+function hexToDecimalString(hex) {
+  return BigInt(hex).toString();
+}
+
+function formatUnits(value, decimals) {
+  const base = 10n ** BigInt(decimals);
+  const whole = value / base;
+  const frac = value % base;
+  return Number(`${whole}.${frac.toString().padStart(decimals, '0')}`);
+}
+
+async function baseRpc(method, params) {
+  const res = await fetch(BASE_RPC_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(JSON.stringify(data.error));
+  return data.result;
+}
+
+async function processPrefundedBaseUsdc(state) {
+  const intents = listFundingIntents(intent =>
+    intent.paymentMethod === 'crypto' &&
+    intent.metadata?.prefundedHotWallet === true &&
+    intent.metadata?.railOption === 'usdc_base' &&
+    intent.status === 'awaiting_payment' &&
+    !intent.metadata?.prefundSourceTxHash
+  );
+
+  if (intents.length === 0) return;
+
+  const latestBlockHex = await baseRpc('eth_blockNumber', []);
+  const latestBlock = parseInt(latestBlockHex, 16);
+  const fromBlock = state.baseUsdcLastBlock ? Number(state.baseUsdcLastBlock) + 1 : Math.max(latestBlock - 5000, 0);
+
+  if (fromBlock > latestBlock) return;
+
+  const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+  const toTopic = '0x' + ATP_EVM_HOT_WALLET.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+  const logs = await baseRpc('eth_getLogs', [{
+    fromBlock: '0x' + fromBlock.toString(16),
+    toBlock: '0x' + latestBlock.toString(16),
+    address: BASE_USDC_ADDRESS,
+    topics: [transferTopic, null, toTopic]
+  }]);
+
+  const rate = await getHbarUsdRate();
+
+  for (const log of logs) {
+    const txId = `baseusdc:${log.transactionHash}`;
+    if (state.processedTxIds.includes(txId)) continue;
+
+    const amount = formatUnits(BigInt(log.data), 6);
+    const intent = intents.find(i => Math.abs((i.metadata?.expectedSourceAmount || 0) - amount) < 0.000001);
+    if (!intent) continue;
+
+    const from = '0x' + (log.topics?.[1] || '').slice(-40);
+    const depositUsd = Number(amount.toFixed(2));
+    const depositHbar = Number((depositUsd / rate).toFixed(8));
+
+    updateFundingIntent(intent.intentId, {
+      status: 'payment_detected',
+      metadata: {
+        prefundSourceTxHash: log.transactionHash,
+        prefundSourceAmount: depositUsd,
+        prefundSourceSender: from,
+        rebalancePending: true,
+      }
+    }, 'prefunded_payment_detected');
+
+    await sendTelegram(intent.renterTelegramChatId, '⏳ Payment detected / confirming.');
+
+    const deposit = {
+      txId,
+      timestamp: log.blockNumber,
+      sender: from,
+      renter: intent.renterName,
+      modelPreference: intent.modelPreference || DEFAULT_MODEL,
+      currentModel: intent.modelPreference || DEFAULT_MODEL,
+      modelName: MODEL_CHOICES[intent.modelPreference || DEFAULT_MODEL]?.name || 'inherit current Aite model',
+      depositHbar,
+      depositUsd,
+      budgetCapUsd: depositUsd,
+      durationMin: 60,
+      hbarUsdRate: rate,
+      tools: FULL_CAPABILITIES,
+      status: 'active',
+      expiresAt: Date.now() + (60 * 60 * 1000),
+      processedAt: new Date().toISOString(),
+      fundingIntentId: intent.intentId,
+      fundingMemo: intent.memo || null,
+      telegramChatId: intent.renterTelegramChatId || null
+    };
+
+    await activateRental(deposit, state);
+  }
+
+  state.baseUsdcLastBlock = latestBlock;
+}
+
 // ── Telegram ────────────────────────────────────────────────────────────────
 
 async function sendTelegram(chatId, text) {
@@ -191,6 +392,18 @@ async function processTransaction(tx, state) {
   // Parse memo (optional — no-memo deposits are now accepted)
   const memo = parseMemo(tx.memo_base64);
   const fundingIntent = memo?.raw ? getFundingIntentByMemo(memo.raw) : null;
+
+  if (fundingIntent?.paymentMethod && ['crypto', 'cash'].includes(fundingIntent.paymentMethod) && fundingIntent.metadata?.swapId) {
+    console.log(`     ℹ️  Swap-funded payout landed for ${fundingIntent.memo}; skipping direct HBAR activation.`);
+    updateFundingIntent(fundingIntent.intentId, {
+      metadata: {
+        swapPayoutTxId: txId,
+        swapPayoutConsensusTs: tx.consensus_timestamp
+      }
+    }, 'swap_payout_landed');
+    state.processedTxIds.push(txId);
+    return null;
+  }
 
   // Get sender
   const sender = transfers.find(t => t.amount < 0 && t.account !== DEPOSIT_ACCOUNT);
@@ -267,6 +480,11 @@ async function activateRental(deposit, state) {
         sender: deposit.sender
       }
     }, 'payment_detected');
+
+    if (deposit.telegramChatId) {
+      await sendTelegram(deposit.telegramChatId, `💰 *Payment detected*\n\nWe received ${deposit.depositHbar.toFixed(2)} HBAR (~$${deposit.depositUsd.toFixed(2)}). Activating your rental now.`);
+    }
+
     updateFundingIntent(deposit.fundingIntentId, { status: 'activating' }, 'activating_rental');
   }
 
@@ -293,6 +511,7 @@ async function activateRental(deposit, state) {
       console.log(`     ✅ Container created: ${data.containerName}`);
       deposit.rentalId = data.rentalId;
       deposit.containerName = data.containerName;
+      containerReady = true;
     } else {
       console.log(`     ⚠️  Monitor error: ${data.error}`);
     }
@@ -305,9 +524,12 @@ async function activateRental(deposit, state) {
   // Connects to local gateway, authenticates, then runs an agent turn in the rental session
   const RENTAL_SESSION_KEY = process.env.RENTAL_SESSION_KEY || 'agent:atp-rental:telegram:group:-5273529238';
   const GATEWAY_PORT = process.env.OPENCLAW_GATEWAY_PORT || '18789';
-  const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || 'e35d238c2262bfb2aeec929bc72b4b2b28255772af135e6d';
+  const GATEWAY_TOKEN = getGatewayToken();
   const activationMsg = `🎉 NEW RENTAL ACTIVATED — User ${deposit.renter} has paid ${deposit.depositHbar.toFixed(2)} HBAR ($${deposit.depositUsd.toFixed(2)} USD). Full capabilities enabled. Initial model behavior: inherit Aite's current model at activation. Budget cap: $${deposit.budgetCapUsd.toFixed(2)}. The renter can change models during the session. Rental session is now ACTIVE. Greet the renter and let them know you're ready to help.`;
+  let containerReady = false;
+  let rpcActivated = false;
   try {
+    if (!GATEWAY_TOKEN) throw new Error('No gateway token available for activation');
     const wsModule = await import('ws');
     const WebSocket = wsModule.WebSocket || wsModule.default;
     const { randomUUID } = await import('crypto');
@@ -378,6 +600,7 @@ async function activateRental(deposit, state) {
     });
 
     console.log(`     ✅ Activation delivered via gateway RPC (run: ${result?.runId || '?'})`);
+    rpcActivated = true;
   } catch (e) {
     console.log(`     ⚠️  Gateway RPC activation failed: ${e.message}`);
     // Fallback: send notification via Telegram (visible to renter, but agent won't auto-respond)
@@ -397,29 +620,57 @@ async function activateRental(deposit, state) {
     }
   }
 
-  // Mark as processed only after activation attempt (prevents lost deposits on restart)
+  // Mark as processed after activation handling so retries don't create duplicates.
   state.processedTxIds.push(deposit.txId);
-  state.activatedRentals.push(deposit);
-  saveState(state);
 
+  if (containerReady && rpcActivated) {
+    state.activatedRentals.push(deposit);
+    saveState(state);
+
+    if (deposit.fundingIntentId) {
+      updateFundingIntent(deposit.fundingIntentId, {
+        status: 'active',
+        activatedAt: new Date().toISOString(),
+        metadata: {
+          rentalId: deposit.rentalId || null,
+          containerName: deposit.containerName || null,
+          depositTxId: deposit.txId,
+          depositUsd: deposit.depositUsd,
+          depositHbar: deposit.depositHbar
+        }
+      }, 'rental_active');
+
+      if (deposit.telegramChatId) {
+        await sendTelegram(deposit.telegramChatId, `🟢 *Rental active*\n\nYour ATP rental is now active and ready. Budget: $${deposit.budgetCapUsd.toFixed(2)}.`);
+      }
+    }
+
+    // Start HCS sidecar loop to log interactions on-chain
+    startSidecarLoop();
+    return deposit;
+  }
+
+  saveState(state);
   if (deposit.fundingIntentId) {
     updateFundingIntent(deposit.fundingIntentId, {
-      status: 'active',
-      activatedAt: new Date().toISOString(),
+      status: 'activation_failed',
       metadata: {
         rentalId: deposit.rentalId || null,
         containerName: deposit.containerName || null,
         depositTxId: deposit.txId,
         depositUsd: deposit.depositUsd,
-        depositHbar: deposit.depositHbar
+        depositHbar: deposit.depositHbar,
+        containerReady,
+        rpcActivated
       }
-    }, 'rental_active');
+    }, 'activation_failed');
+
+    if (deposit.telegramChatId) {
+      await sendTelegram(deposit.telegramChatId, `⚠️ Payment received, but rental activation is still being completed.`);
+    }
   }
 
-  // Start HCS sidecar loop to log interactions on-chain
-  startSidecarLoop();
-
-  return deposit;
+  return null;
 }
 
 // ── HCS Sidecar Integration ─────────────────────────────────────────────────
@@ -513,6 +764,8 @@ async function poll() {
     }
   }
 
+  await processPrefundedBaseUsdc(state);
+  await processNonHbarFunding(state);
   saveState(state);
 }
 

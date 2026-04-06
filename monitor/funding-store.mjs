@@ -75,12 +75,30 @@ export function getFundingIntentByMemo(memo) {
   return intentId ? state.intents[intentId] || null : null;
 }
 
+export function listFundingIntents(predicate = null) {
+  const state = loadFundingState();
+  const intents = Object.values(state.intents || {});
+  return predicate ? intents.filter(predicate) : intents;
+}
+
 export function updateFundingIntent(intentId, patch = {}, note = '') {
   const state = loadFundingState();
   const intent = state.intents[intentId];
   if (!intent) return null;
-  Object.assign(intent, patch);
-  if (patch.memo && patch.memo !== intent.memo) state.byMemo[patch.memo] = intentId;
+
+  const previousMemo = intent.memo;
+  const mergedPatch = { ...patch };
+  if (patch.metadata) {
+    mergedPatch.metadata = { ...(intent.metadata || {}), ...patch.metadata };
+  }
+
+  Object.assign(intent, mergedPatch);
+
+  if (patch.memo && patch.memo !== previousMemo) {
+    if (previousMemo && state.byMemo[previousMemo] === intentId) delete state.byMemo[previousMemo];
+    state.byMemo[patch.memo] = intentId;
+  }
+
   if (patch.status) {
     intent.history = intent.history || [];
     intent.history.push({ at: new Date().toISOString(), status: patch.status, note: note || patch.status });

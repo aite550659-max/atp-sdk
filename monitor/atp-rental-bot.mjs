@@ -19,13 +19,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createFundingIntent } from './funding-store.mjs';
+import { createFundingIntent, listFundingIntents } from './funding-store.mjs';
+import { createRailIntent } from './funding-rails.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BOT_TOKEN = process.env.RENTAL_BOT_TOKEN || '8527162069:AAG5Fg4iM8XatgEBeWj6UkQ2i00PGOypMng';
 const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const DEPOSIT_STATE = path.join(__dirname, 'deposit-state.json');
-const DEPOSIT_ACCOUNT = '0.0.10255397';
+const DEPOSIT_ACCOUNT = '0.0.10421318';
 const MONITOR_URL = process.env.MONITOR_URL || 'http://localhost:3500';
 const RENTAL_SESSION_KEY = process.env.RENTAL_SESSION_KEY || 'agent:atp-rental:telegram:group:-5273529238';
 const GATEWAY_PORT = process.env.OPENCLAW_GATEWAY_PORT || '18789';
@@ -168,6 +169,19 @@ async function sendWithButtons(chatId, text, buttons) {
   });
 }
 
+function buildQrUrl(text) {
+  return `https://quickchart.io/qr?text=${encodeURIComponent(text)}&size=600`;
+}
+
+async function sendQr(chatId, text, caption = '') {
+  return tg('sendPhoto', {
+    chat_id: chatId,
+    photo: buildQrUrl(text),
+    caption,
+    parse_mode: 'Markdown'
+  });
+}
+
 async function answerCallback(callbackQueryId, text) {
   return tg('answerCallbackQuery', {
     callback_query_id: callbackQueryId,
@@ -212,7 +226,8 @@ async function handleRent(chatId, from) {
   const hbarPrice = await getHbarPrice();
   const starterHbarAmount = (RECOMMENDED_STARTER_USD / hbarPrice).toFixed(2);
   const username = from.username || from.first_name || `user${from.id}`;
-  const memo = `rent-${username}`;
+  const safeName = String(username).toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 12) || `u${from.id}`;
+  const memo = `rent-${safeName}-${Date.now().toString().slice(-6)}`;
 
   const state = loadDepositState();
   state.pendingDeposits = state.pendingDeposits || {};
@@ -225,7 +240,7 @@ async function handleRent(chatId, from) {
   };
   saveDepositState(state);
 
-  createFundingIntent({
+  const fundingIntent = createFundingIntent({
     memo,
     renterName: username,
     renterTelegramChatId: chatId,
@@ -256,8 +271,8 @@ _Current HBAR price: $${hbarPrice.toFixed(4)}_
 _Payment is monitored automatically_`,
     [
       [{ text: 'Pay with HBAR', callback_data: `pay_hbar:${memo}` }],
-      [{ text: 'Pay with Crypto', callback_data: 'pay_crypto_soon' }],
-      [{ text: 'Pay with Cash', callback_data: 'pay_cash_soon' }],
+      [{ text: 'Pay with Crypto', callback_data: `pay_crypto_menu:${fundingIntent.intentId}` }],
+      [{ text: 'Pay with Cash', callback_data: `pay_cash:${fundingIntent.intentId}` }],
     ]
   );
 }
@@ -282,23 +297,38 @@ Remaining: ${remaining} minutes
 Capabilities: ${FULL_CAPABILITIES.join(', ')}
 
 _You can ask to change models during the session._
-_Your session activity is logged for transparency_`
+_You’ll receive a verifiable receipt of activity when the session ends._`
     );
     return;
   }
 
-  // Check for pending deposits
-  const pending = Object.entries(state.pendingDeposits || {}).find(([_, v]) =>
-    v.renterName === username
-  );
+  const intents = listFundingIntents(intent =>
+    intent.renterTelegramUserId === from.id || intent.renterName === username
+  ).sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
-  if (pending) {
+  const liveIntent = intents.find(i => ['awaiting_payment', 'payment_detected', 'converting', 'activating'].includes(i.status));
+  if (liveIntent) {
+    const statusLabel = {
+      awaiting_payment: 'Awaiting payment',
+      payment_detected: 'Payment detected',
+      converting: 'Converting payment',
+      activating: 'Activating rental'
+    }[liveIntent.status] || liveIntent.status;
+
+    const depositDetails = liveIntent.paymentMethod === 'hbar'
+      ? `Memo: \`${liveIntent.memo}\`\nDeposit account: \`${DEPOSIT_ACCOUNT}\``
+      : (liveIntent.metadata?.swapDepositAddress
+          ? `Funding address: \`${liveIntent.metadata.swapDepositAddress}\`${liveIntent.metadata?.swapDepositMemo ? `\nMemo/tag: \`${liveIntent.metadata.swapDepositMemo}\`` : ''}`
+          : 'Funding instructions already generated for this intent.');
+
     await send(chatId,
-`⏳ *Pending Payment*
+`⏳ *Funding Status*
 
-Your rental is waiting for payment. Send HBAR to \`${DEPOSIT_ACCOUNT}\` with memo \`${pending[0]}\`.
+Status: ${statusLabel}
+Payment method: ${liveIntent.paymentMethod.toUpperCase()}
+${depositDetails}
 
-Use /rent to start a new rental.`
+Your deposit becomes your budget. Use /rent if you want to generate a fresh payment flow.`
     );
     return;
   }
@@ -424,18 +454,78 @@ You can send more if you want a larger budget.
 ⏳ Once your payment is detected (usually within 30 seconds), your session will activate automatically.
 
 _Payment is monitored automatically_`);
+      await sendQr(chatId, `${DEPOSIT_ACCOUNT}|${memo}`, 'QR for HBAR payment');
       return;
     }
 
-    if (data === 'pay_crypto_soon') {
-      await answerCallback(cq.id, 'Pay with Crypto is coming soon');
-      if (chatId) await send(chatId, '🪙 *Pay with Crypto* is coming soon. For now, ATP rentals start with *HBAR*.', {});
+    if (data.startsWith('pay_crypto_menu:') && chatId) {
+      const intentId = data.split(':')[1];
+      await answerCallback(cq.id, 'Choose a crypto rail');
+      await sendWithButtons(chatId,
+`🪙 *Pay with Crypto*
+
+Choose the asset you want to use. Your rental will activate when funding completes.`,
+        [
+          [{ text: 'USDC on Base', callback_data: `pay_crypto_option:${intentId}:usdc_base` }],
+          [{ text: 'USDC on Ethereum', callback_data: `pay_crypto_option:${intentId}:usdc_eth` }],
+          [{ text: 'USDT on Ethereum', callback_data: `pay_crypto_option:${intentId}:usdt_eth` }],
+          [{ text: 'ETH', callback_data: `pay_crypto_option:${intentId}:eth` }],
+          [{ text: 'SOL', callback_data: `pay_crypto_option:${intentId}:sol` }],
+          [{ text: 'BTC', callback_data: `pay_crypto_option:${intentId}:btc` }],
+        ]
+      );
       return;
     }
 
-    if (data === 'pay_cash_soon') {
-      await answerCallback(cq.id, 'Pay with Cash is coming soon');
-      if (chatId) await send(chatId, '💵 *Pay with Cash* is coming soon. For now, ATP rentals start with *HBAR*.', {});
+    if (data.startsWith('pay_crypto_option:') && chatId) {
+      const [, intentId, optionKey] = data.split(':');
+      await answerCallback(cq.id, 'Creating payment instructions...');
+      try {
+        const intent = await createRailIntent(intentId, optionKey, DEPOSIT_ACCOUNT);
+        const meta = intent?.metadata || {};
+        if (meta.prefundedHotWallet) {
+          await send(chatId,
+`🪙 *Crypto payment ready*
+
+Send *${meta.expectedSourceAmount} ${intent.sourceAsset}* on *${intent.sourceChain}* to get started:
+\`${meta.hotWalletAddress}\`
+
+Your rental will activate from ATP hot-wallet liquidity once payment is detected.`);
+          await sendQr(chatId, meta.hotWalletAddress, 'QR for crypto payment');
+        } else {
+          await send(chatId,
+`🪙 *Crypto payment ready*
+
+Send a minimum of *${meta.estimatedSourceAmount} ${intent.sourceAsset}* on *${intent.sourceChain}* to get started:
+\`${meta.swapDepositAddress}\`${meta.swapDepositMemo ? `\n\nMemo/tag:\n\`${meta.swapDepositMemo}\`` : ''}
+
+Your *deposit becomes your budget*.
+Status updates are tracked automatically and your rental will activate when funding completes.`);
+          await sendQr(chatId, meta.swapDepositAddress, 'QR for crypto payment');
+        }
+      } catch (e) {
+        await send(chatId, `Could not create the crypto payment flow right now: ${e.message}`);
+      }
+      return;
+    }
+
+    if (data.startsWith('pay_cash:') && chatId) {
+      const intentId = data.split(':')[1];
+      await answerCallback(cq.id, 'Creating checkout link...');
+      try {
+        const intent = await createRailIntent(intentId, 'cash_card', DEPOSIT_ACCOUNT);
+        const meta = intent?.metadata || {};
+        if (!meta.onrampUrl) throw new Error('cash checkout provider is not configured');
+        await send(chatId,
+`💵 *Pay with Cash / Card*
+
+Complete checkout here:
+${meta.onrampUrl}
+
+This checkout funds your rental budget automatically. Once payment clears and conversion completes, your rental will activate.`);
+      } catch (e) {
+        await send(chatId, `Could not create the cash/card checkout right now: ${e.message}`);
+      }
       return;
     }
 

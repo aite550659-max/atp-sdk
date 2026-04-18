@@ -2,9 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getFundingIntent, updateFundingIntent } from './funding-store.mjs';
+import { createOrder as createPayPalOrder, isConfigured as isPayPalConfigured } from './paypal-checkout.mjs';
+import { getRelayUrl, swapEstimate, swapCreate } from './relay-client.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const RELAY_URL = process.env.VAL_RELAY_URL || 'http://localhost:3141';
+const RELAY_URL = getRelayUrl();
 const COINBASE_CDP_PATH = path.join(__dirname, '..', 'coinbase-cdp.json');
 const HBAR_HOT_WALLET = process.env.ATP_HBAR_HOT_WALLET || '0.0.10421318';
 const EVM_HOT_WALLET = process.env.ATP_EVM_HOT_WALLET || '0x0868eC02bb536c24694123ec1c2066Af6Ba6D620';
@@ -20,6 +22,8 @@ const CRYPTO_OPTIONS = {
   usdc_eth: { label: 'USDC on Ethereum', rail: 'crypto', sourceAsset: 'USDC', sourceChain: 'ethereum', estimateAsset: 'usdc-eth', fixedUsd: true },
   usdt_eth: { label: 'USDT on Ethereum', rail: 'crypto', sourceAsset: 'USDT', sourceChain: 'ethereum', estimateAsset: 'usdt-eth', fixedUsd: true },
   cash_card: { label: 'Card / debit checkout', rail: 'cash', sourceAsset: 'USDC', sourceChain: 'base', estimateAsset: 'usdc-base', fixedUsd: true },
+  paypal: { label: 'PayPal', rail: 'paypal', sourceAsset: 'USD', sourceChain: 'paypal', fixedUsd: true },
+  venmo: { label: 'Venmo', rail: 'paypal', sourceAsset: 'USD', sourceChain: 'venmo', fixedUsd: true },
 };
 
 function getCoinbaseProjectId() {
@@ -88,26 +92,9 @@ async function getHbarHotWalletLiquidityUsd() {
   }
 }
 
-async function getEstimate(from, amount) {
-  const url = new URL(`${RELAY_URL}/v1/swap/estimate`);
-  url.searchParams.set('from', from);
-  if (amount) url.searchParams.set('amount', String(amount));
-  const res = await fetch(url);
-  const data = await res.json();
-  if (!res.ok || data.error) throw new Error(data.error || `Estimate failed for ${from}`);
-  return data;
-}
-
-async function createSwap(from, amount, accountId, payoutMemo) {
-  const res = await fetch(`${RELAY_URL}/v1/swap/create`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from, amount, accountId, payoutMemo })
-  });
-  const data = await res.json();
-  if (!res.ok || data.error) throw new Error(data.error || 'Swap creation failed');
-  return data;
-}
+// Swap helpers delegated to relay-client.mjs
+const getEstimate = swapEstimate;
+const createSwap = swapCreate;
 
 export function getFundingOption(optionKey) {
   return CRYPTO_OPTIONS[optionKey] || null;
@@ -146,6 +133,36 @@ export async function createRailIntent(intentId, optionKey, accountId) {
         },
       }, `rail_selected:${optionKey}:prefunded`);
     }
+  }
+
+  // PayPal/Venmo rail — create PayPal order instead of ChangeNOW swap
+  if (option.rail === 'paypal') {
+    if (!isPayPalConfigured()) throw new Error('PayPal credentials not configured');
+    const fundingSource = optionKey === 'venmo' ? 'venmo' : 'paypal';
+    const amount = intent.targetBudgetUsd || 5;
+    const order = await createPayPalOrder({
+      amount,
+      fundingSource,
+      description: `ATP Agent Rental — ${intent.renterName || 'rental'}`,
+      referenceId: intentId,
+    });
+
+    return updateFundingIntent(intentId, {
+      paymentMethod: option.rail,
+      sourceAsset: option.sourceAsset,
+      sourceChain: option.sourceChain,
+      status: 'awaiting_payment',
+      metadata: {
+        ...(intent.metadata || {}),
+        railOption: optionKey,
+        railLabel: option.label,
+        paypalOrderId: order.orderId,
+        paypalStatus: order.status,
+        paypalApprovalUrl: order.approvalUrl,
+        paypalFundingSource: fundingSource,
+        expectedSourceAmount: amount,
+      },
+    }, `rail_selected:${optionKey}`);
   }
 
   const estimate = await getEstimate(option.estimateAsset, requestedAmount);

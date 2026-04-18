@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
  * ATP Multi-Tenant Monitor
- * 
+ *
  * Lightweight owner dashboard for managing rental containers.
  * Tracks: active rentals, costs, HCS audit status, breach alerts.
  * Provides: web UI + REST API + CLI commands.
- * 
+ *
  * Usage:
  *   node monitor/atp-monitor.mjs                    # Start web dashboard on :3500
  *   node monitor/atp-monitor.mjs --port 4000        # Custom port
@@ -19,29 +19,69 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
+import { updateFundingIntent } from './funding-store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function loadKeychainValue(service) {
+  try {
+    return execSync(`security find-generic-password -s ${service} -w`, { encoding: 'utf8', timeout: 5000 }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+const RENTAL_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || loadKeychainValue('rental-bot-token');
 const STATE_FILE = path.join(__dirname, 'monitor-state.json');
+const DEPOSIT_STATE_FILE = path.join(__dirname, 'deposit-state.json');
+const LOCK_FILE = path.join(__dirname, 'atp-monitor.lock');
 const MODEL_PREFERENCE_FILE = path.join(__dirname, '..', 'data', 'model_preference.json');
 const PORT = parseInt(process.argv.find((_, i, a) => a[i - 1] === '--port') || '3500');
+const RENTAL_MEMORY_LIMIT = process.env.ATP_RENTAL_MEMORY_LIMIT || '2g';
+const RENTAL_CPU_LIMIT = process.env.ATP_RENTAL_CPU_LIMIT || '1.0';
+const CONTAINER_READY_TIMEOUT_SECONDS = Number(process.env.ATP_CONTAINER_READY_TIMEOUT_SECONDS || 45);
+const CONTAINER_MISSING_GRACE_MS = Number(process.env.ATP_CONTAINER_MISSING_GRACE_MS || 45_000);
+let lastContainerReconcile = {
+  ranAt: null,
+  activeRentals: 0,
+  runningContainers: 0,
+  missingContainers: 0,
+  orphanContainers: 0,
+  repairedMappings: 0,
+  terminatedRentals: 0,
+  killedOrphans: 0,
+};
+let reconcileInFlight = false;
+const missingContainerSince = new Map();
 
 // ── State Management ────────────────────────────────────────────────────────
 
 function loadState() {
+  const defaults = {
+    rentals: {},
+    alerts: [],
+    config: {
+      maxConcurrentRentals: 5,
+      defaultBudgetCap: 10.00,
+      hcsTopicId: '0.0.10272696',
+      alertWebhook: null,
+      ownerTelegramId: '359827754'
+    }
+  };
+
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-  } catch {
+    const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     return {
-      rentals: {},
-      alerts: [],
+      rentals: raw?.rentals || {},
+      alerts: Array.isArray(raw?.alerts) ? raw.alerts : [],
       config: {
-        maxConcurrentRentals: 5,
-        defaultBudgetCap: 10.00,
-        hcsTopicId: '0.0.10272696',
-        alertWebhook: null,
-        ownerTelegramId: '359827754'
+        ...defaults.config,
+        ...(raw?.config || {}),
+        hcsTopicId: raw?.config?.hcsTopicId || raw?.config?.hcsTopic || defaults.config.hcsTopicId,
       }
     };
+  } catch {
+    return defaults;
   }
 }
 
@@ -49,13 +89,123 @@ function saveState(state) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
+function loadDepositState() {
+  try {
+    return JSON.parse(fs.readFileSync(DEPOSIT_STATE_FILE, 'utf8'));
+  } catch {
+    return { pendingDeposits: {}, activatedRentals: [] };
+  }
+}
+
+function saveDepositState(state) {
+  fs.writeFileSync(DEPOSIT_STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+function toExpiryTimestamp(value, durationMin = 60) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsedNumber = Number(value);
+    if (Number.isFinite(parsedNumber) && parsedNumber > 0) return parsedNumber;
+    const parsedDate = Date.parse(value);
+    if (!Number.isNaN(parsedDate)) return parsedDate;
+  }
+  return Date.now() + (Number(durationMin || 60) * 60 * 1000);
+}
+
+function fundingTerminalStatus(reason, expiresAt = null) {
+  if (reason === 'renter_terminated' || reason === 'completed') return 'completed';
+  if (reason === 'timeout' || (expiresAt && expiresAt <= Date.now())) return 'expired';
+  return 'terminated';
+}
+
+function syncDepositRentalState(rentalId, patch = {}) {
+  if (!rentalId) return;
+  const depositState = loadDepositState();
+  let changed = false;
+  depositState.activatedRentals = (depositState.activatedRentals || []).map(rental => {
+    if (rental.rentalId !== rentalId) return rental;
+    changed = true;
+    return { ...rental, ...patch };
+  });
+  if (changed) saveDepositState(depositState);
+}
+
+function syncFundingIntentForRental(rental, reason = 'terminated') {
+  const fundingIntentId = rental?.fundingIntentId || rental?.metadata?.fundingIntentId || null;
+  if (!fundingIntentId) return;
+  const status = fundingTerminalStatus(reason, rental?.expiresAt || null);
+  updateFundingIntent(fundingIntentId, {
+    status,
+    metadata: {
+      rentalId: rental.rentalId,
+      containerName: rental.containerName,
+      endedAt: rental.endedAt || new Date().toISOString(),
+      terminalReason: reason,
+      finalCostUsd: rental.costAccrued ?? 0,
+      finalInteractionCount: rental.interactionCount ?? 0,
+    }
+  }, `rental_${status}`);
+}
+
+function processExists(pid) {
+  if (!pid || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function acquireLock() {
+  try {
+    fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx' });
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    const existingPid = Number(fs.readFileSync(LOCK_FILE, 'utf8').trim());
+    if (processExists(existingPid)) {
+      throw new Error(`ATP monitor already running (pid ${existingPid})`);
+    }
+    fs.unlinkSync(LOCK_FILE);
+    fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx' });
+  }
+
+  const release = () => {
+    try {
+      const current = fs.readFileSync(LOCK_FILE, 'utf8').trim();
+      if (current === String(process.pid)) fs.unlinkSync(LOCK_FILE);
+    } catch {}
+  };
+
+  process.on('exit', release);
+  process.on('SIGINT', () => { release(); process.exit(130); });
+  process.on('SIGTERM', () => { release(); process.exit(143); });
+}
+
 function getCurrentAiteModel() {
   try {
-    const raw = JSON.parse(fs.readFileSync(MODEL_PREFERENCE_FILE, 'utf8'));
-    return raw.model || 'sonnet';
+    const liveConfigPath = path.join(process.env.HOME || '', '.openclaw', 'openclaw.json');
+    const liveConfig = JSON.parse(fs.readFileSync(liveConfigPath, 'utf8'));
+    return liveConfig?.agents?.defaults?.model?.primary || process.env.OPENCLAW_DEFAULT_MODEL || 'openai/gpt-5.4';
   } catch {
-    return process.env.OPENCLAW_DEFAULT_MODEL || 'sonnet';
+    try {
+      const raw = JSON.parse(fs.readFileSync(MODEL_PREFERENCE_FILE, 'utf8'));
+      return raw.model || process.env.OPENCLAW_DEFAULT_MODEL || 'openai/gpt-5.4';
+    } catch {
+      return process.env.OPENCLAW_DEFAULT_MODEL || 'openai/gpt-5.4';
+    }
   }
+}
+
+function normalizeRentalModel(model) {
+  // Pass through the raw model string — rentals should use whatever Aite uses.
+  // Only normalize known aliases; everything else passes through as-is.
+  const raw = String(model || '').trim();
+  if (!raw) return getCurrentAiteModel();
+  const lower = raw.toLowerCase();
+  if (['haiku', 'sonnet', 'opus'].includes(lower)) return lower;
+  // Full provider/model strings pass through directly (e.g., openai/gpt-5.4)
+  return raw;
 }
 
 // ── Docker Operations ───────────────────────────────────────────────────────
@@ -69,12 +219,30 @@ function dockerExec(cmd) {
 }
 
 function getRunningContainers() {
-  const raw = dockerExec('ps --filter "label=atp.role=rental" --format "{{.ID}}\\t{{.Names}}\\t{{.Status}}\\t{{.CreatedAt}}"');
+  // Use JSON output to avoid Go template quoting issues with label keys containing dots
+  const raw = dockerExec('ps --filter "label=atp.role=rental" --format "{{json .}}"');
   if (!raw) return [];
   return raw.split('\n').filter(Boolean).map(line => {
-    const [id, name, ...rest] = line.split('\t');
-    return { id, name, status: rest.slice(0, -1).join('\t'), createdAt: rest.at(-1) };
-  });
+    try {
+      const obj = JSON.parse(line);
+      const labels = obj.Labels || '';
+      const labelMap = {};
+      for (const pair of labels.split(',')) {
+        const eq = pair.indexOf('=');
+        if (eq > 0) labelMap[pair.slice(0, eq)] = pair.slice(eq + 1);
+      }
+      return {
+        id: obj.ID,
+        name: obj.Names,
+        status: obj.Status,
+        createdAt: obj.CreatedAt,
+        rentalId: labelMap['atp.rental-id'] || null,
+        renterId: labelMap['atp.renter-id'] || null
+      };
+    } catch {
+      return null;
+    }
+  }).filter(Boolean);
 }
 
 function getContainerStats(containerId) {
@@ -94,14 +262,35 @@ function killContainer(containerId) {
 
 // ── Rental Management ───────────────────────────────────────────────────────
 
-function createRental(state, { renterId, renterName, budgetCap, modelPreference }) {
+function waitForContainerHealthy(containerName, timeoutSeconds = CONTAINER_READY_TIMEOUT_SECONDS) {
+  const command = [
+    'bash -lc',
+    `'deadline=$((SECONDS + ${timeoutSeconds})); while [ $SECONDS -lt $deadline ]; do status=$(docker inspect --format "{{.State.Status}}" ${containerName} 2>/dev/null || echo missing); health=$(docker inspect --format "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}" ${containerName} 2>/dev/null || echo missing); if [ "$status" = "running" ] && { [ "$health" = "healthy" ] || [ "$health" = "none" ]; }; then exit 0; fi; if [ "$status" = "exited" ] || [ "$status" = "dead" ] || [ "$status" = "missing" ]; then exit 2; fi; sleep 1; done; exit 1'`
+  ].join(' ');
+
+  try {
+    execSync(command, { stdio: 'ignore' });
+    return { ok: true };
+  } catch {
+    try {
+      const details = execSync(`docker inspect --format "status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}" ${containerName}`, { encoding: 'utf8', timeout: 5000 }).trim();
+      return { ok: false, error: details || 'container readiness check failed' };
+    } catch (inspectError) {
+      return { ok: false, error: inspectError.message || 'container readiness check failed' };
+    }
+  }
+}
+
+function createRental(state, { renterId, renterName, budgetCap, modelPreference, fundingIntentId = null, fundingMemo = null, durationMin = 60, expiresAt = null, telegramChatId = null }) {
   const rentalId = `rental-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
   const containerName = `atp-${rentalId}`;
   const inheritedModel = getCurrentAiteModel();
-  const effectiveModel = modelPreference && modelPreference !== 'inherit_current'
-    ? modelPreference
+  const effectiveModel = (modelPreference && modelPreference !== 'inherit_current')
+    ? normalizeRentalModel(modelPreference)
     : inheritedModel;
-  
+  const effectiveDurationMin = Number(durationMin || 60);
+  const effectiveExpiresAt = toExpiryTimestamp(expiresAt, effectiveDurationMin);
+
   // Check concurrent limit
   const activeCount = Object.values(state.rentals).filter(r => r.status === 'active').length;
   if (activeCount >= state.config.maxConcurrentRentals) {
@@ -125,11 +314,17 @@ function createRental(state, { renterId, renterName, budgetCap, modelPreference 
       '--security-opt no-new-privileges:true',
       '--cap-drop ALL',
       '--cap-add NET_RAW',
-      '--memory 1g',
-      '--cpus 1.0',
+      `--memory ${RENTAL_MEMORY_LIMIT}`,
+      `--cpus ${RENTAL_CPU_LIMIT}`,
       '--restart unless-stopped',
       'atp-rental'
     ].join(' '), { encoding: 'utf8' }).trim();
+
+    const readiness = waitForContainerHealthy(containerName);
+    if (!readiness.ok) {
+      try { killContainer(containerName); } catch {}
+      return { error: `Container failed readiness check: ${readiness.error}` };
+    }
 
     state.rentals[rentalId] = {
       rentalId,
@@ -141,11 +336,19 @@ function createRental(state, { renterId, renterName, budgetCap, modelPreference 
       inheritedModel,
       currentModel: effectiveModel,
       modelPreference: modelPreference || 'inherit_current',
+      fundingIntentId,
+      fundingMemo,
+      telegramChatId: telegramChatId || null,
       modelChangedAt: null,
       costAccrued: 0,
       interactionCount: 0,
+      topupCount: 0,
+      topupUsd: 0,
+      topups: [],
       status: 'active',
       startedAt: new Date().toISOString(),
+      durationMin: effectiveDurationMin,
+      expiresAt: effectiveExpiresAt,
       endedAt: null,
       endReason: null,
       hcsSequences: [],
@@ -166,9 +369,11 @@ function endRental(state, rentalId, reason = 'owner_terminated') {
   // Run full kill sequence (HCS + notification + container kill)
   const killScript = path.join(__dirname, 'kill-rental.mjs');
   try {
+    const killEnv = { ...process.env, PATH: process.env.PATH };
+    if (RENTAL_BOT_TOKEN) killEnv.TELEGRAM_BOT_TOKEN = RENTAL_BOT_TOKEN;
     const output = execSync(
       `node ${killScript} ${rentalId} ${reason}`,
-      { encoding: 'utf8', timeout: 30000, env: { ...process.env, PATH: process.env.PATH } }
+      { encoding: 'utf8', timeout: 30000, env: killEnv }
     );
     console.log(output);
   } catch (e) {
@@ -182,21 +387,325 @@ function endRental(state, rentalId, reason = 'owner_terminated') {
   rental.endReason = reason;
   saveState(state);
 
+  syncDepositRentalState(rentalId, {
+    status: fundingTerminalStatus(reason, rental.expiresAt),
+    endedAt: rental.endedAt,
+    endReason: reason,
+  });
+  syncFundingIntentForRental(rental, reason);
+
   return { ok: true, rentalId, reason };
+}
+
+function reapExpiredRentals() {
+  const state = loadState();
+  const now = Date.now();
+  const expired = Object.values(state.rentals || {}).filter(rental =>
+    rental.status === 'active' && rental.expiresAt && Number(rental.expiresAt) <= now
+  );
+
+  for (const rental of expired) {
+    console.log(`⏰ Expiring rental ${rental.rentalId} (expired at ${new Date(Number(rental.expiresAt)).toISOString()})`);
+    endRental(state, rental.rentalId, 'timeout');
+  }
+}
+
+function reconcileContainerState() {
+  if (reconcileInFlight) return;
+  reconcileInFlight = true;
+
+  try {
+    const state = loadState();
+    const runningContainers = getRunningContainers();
+    const runningByName = new Map(runningContainers.map(container => [container.name, container]));
+    const runningByRentalId = new Map();
+    for (const container of runningContainers) {
+      if (!container.rentalId) continue;
+      if (!runningByRentalId.has(container.rentalId)) runningByRentalId.set(container.rentalId, []);
+      runningByRentalId.get(container.rentalId).push(container);
+    }
+    const activeRentals = Object.values(state.rentals || {}).filter(rental => rental.status === 'active');
+    if (runningContainers.length > 0 || activeRentals.length > 0) {
+      console.log(`[reconcile] ${runningContainers.length} running containers, ${activeRentals.length} active rentals`);
+      for (const c of runningContainers) console.log(`  container: ${c.name} rentalId=${c.rentalId}`);
+      for (const r of activeRentals) console.log(`  rental: ${r.rentalId} container=${r.containerName}`);
+    }
+    const summary = {
+      ranAt: new Date().toISOString(),
+      activeRentals: activeRentals.length,
+      runningContainers: runningContainers.length,
+      missingContainers: 0,
+      orphanContainers: 0,
+      repairedMappings: 0,
+      terminatedRentals: 0,
+      killedOrphans: 0,
+      splitBrainConflicts: 0,
+      splitBrainResolved: 0,
+      duplicateActiveMappings: 0,
+      duplicateLabelContainers: 0,
+      ambiguousTerminations: 0,
+    };
+
+    let stateChanged = false;
+    const terminations = new Map();
+    const processedDuplicateGroups = new Set();
+
+    function scheduleTermination(rentalId, reason, alertType, message) {
+      if (!rentalId || terminations.has(rentalId)) return;
+      terminations.set(rentalId, { reason, alertType, message });
+    }
+
+    function createdAtMs(value) {
+      const parsed = Date.parse(value || '');
+      return Number.isNaN(parsed) ? 0 : parsed;
+    }
+
+    function chooseCanonicalContainer(rental, containers) {
+      if (!containers || containers.length === 0) return null;
+      const byStoredId = rental.containerId
+        ? containers.find(container => container.id.startsWith(rental.containerId))
+        : null;
+      if (byStoredId) return byStoredId;
+
+      const byStoredName = rental.containerName
+        ? containers.find(container => container.name === rental.containerName)
+        : null;
+      if (byStoredName) return byStoredName;
+
+      return [...containers].sort((a, b) => createdAtMs(b.createdAt) - createdAtMs(a.createdAt))[0];
+    }
+
+    function reconcileDuplicateActiveGroup(groupKey, rentals) {
+      if (rentals.length < 2) return;
+      const memberKey = rentals.map(rental => rental.rentalId).sort().join(',');
+      if (processedDuplicateGroups.has(memberKey)) return;
+      processedDuplicateGroups.add(memberKey);
+      summary.duplicateActiveMappings++;
+
+      const liveCandidates = [];
+      const seen = new Set();
+      for (const rental of rentals) {
+        if (rental.containerName) {
+          const byName = runningByName.get(rental.containerName);
+          if (byName && !seen.has(byName.id)) {
+            liveCandidates.push(byName);
+            seen.add(byName.id);
+          }
+        }
+        for (const container of (runningByRentalId.get(rental.rentalId) || [])) {
+          if (!seen.has(container.id)) {
+            liveCandidates.push(container);
+            seen.add(container.id);
+          }
+        }
+      }
+
+      let winner = null;
+      if (liveCandidates.length === 1 && liveCandidates[0].rentalId) {
+        const labelMatches = rentals.filter(rental => rental.rentalId === liveCandidates[0].rentalId);
+        if (labelMatches.length === 1) winner = labelMatches[0];
+      }
+
+      if (!winner) {
+        summary.splitBrainConflicts++;
+        summary.ambiguousTerminations += rentals.length;
+        for (const rental of rentals) {
+          scheduleTermination(
+            rental.rentalId,
+            'split_brain_ambiguous',
+            'split_brain_ambiguous',
+            `Active rentals share ${groupKey} with no single canonical winner; terminating ambiguous split-brain state.`
+          );
+        }
+        return;
+      }
+
+      for (const rental of rentals) {
+        if (rental.rentalId === winner.rentalId) continue;
+        summary.splitBrainResolved++;
+        scheduleTermination(
+          rental.rentalId,
+          'split_brain_duplicate',
+          'split_brain_duplicate',
+          `Rental ${rental.rentalId} duplicated ${groupKey}; keeping ${winner.rentalId} as canonical.`
+        );
+      }
+    }
+
+    const activeByContainerName = new Map();
+    const activeByContainerId = new Map();
+    for (const rental of activeRentals) {
+      if (rental.containerName) {
+        if (!activeByContainerName.has(rental.containerName)) activeByContainerName.set(rental.containerName, []);
+        activeByContainerName.get(rental.containerName).push(rental);
+      }
+      if (rental.containerId) {
+        if (!activeByContainerId.has(rental.containerId)) activeByContainerId.set(rental.containerId, []);
+        activeByContainerId.get(rental.containerId).push(rental);
+      }
+    }
+
+    for (const [containerName, rentals] of activeByContainerName.entries()) {
+      reconcileDuplicateActiveGroup(`container name ${containerName}`, rentals);
+    }
+
+    for (const [containerId, rentals] of activeByContainerId.entries()) {
+      reconcileDuplicateActiveGroup(`container id ${containerId}`, rentals);
+    }
+
+    for (const rental of activeRentals) {
+      if (terminations.has(rental.rentalId)) continue;
+
+      const byName = rental.containerName ? runningByName.get(rental.containerName) : null;
+      const byRentalIdCandidates = runningByRentalId.get(rental.rentalId) || [];
+
+      let canonicalByLabel = byRentalIdCandidates[0] || null;
+      if (byName || canonicalByLabel) missingContainerSince.delete(rental.rentalId);
+      if (byRentalIdCandidates.length > 1) {
+        summary.splitBrainConflicts++;
+        summary.duplicateLabelContainers += (byRentalIdCandidates.length - 1);
+        canonicalByLabel = chooseCanonicalContainer(rental, byRentalIdCandidates);
+        const staleContainers = byRentalIdCandidates.filter(container => container.id !== canonicalByLabel.id);
+
+        rental.containerName = canonicalByLabel.name;
+        rental.containerId = canonicalByLabel.id.slice(0, 12);
+        stateChanged = true;
+        summary.repairedMappings++;
+
+        for (const staleContainer of staleContainers) {
+          addAlert(state, rental.rentalId, 'split_brain_duplicate_container', `Multiple live containers claimed rental ${rental.rentalId}; keeping ${canonicalByLabel.name}, killing ${staleContainer.name}.`);
+          killContainer(staleContainer.id);
+          summary.killedOrphans++;
+          summary.splitBrainResolved++;
+        }
+      }
+
+      if (byName && canonicalByLabel && byName.id !== canonicalByLabel.id) {
+        summary.splitBrainConflicts++;
+        rental.containerName = canonicalByLabel.name;
+        rental.containerId = canonicalByLabel.id.slice(0, 12);
+        stateChanged = true;
+        summary.repairedMappings++;
+        summary.splitBrainResolved++;
+        addAlert(state, rental.rentalId, 'split_brain_reconciled', `Rental ${rental.rentalId} had conflicting name and label matches; label-bound container ${canonicalByLabel.name} won.`);
+        continue;
+      }
+
+      if (!byName && canonicalByLabel) {
+        rental.containerName = canonicalByLabel.name;
+        rental.containerId = canonicalByLabel.id.slice(0, 12);
+        stateChanged = true;
+        summary.repairedMappings++;
+        addAlert(state, rental.rentalId, 'container_reconciled', `Rental ${rental.rentalId} container mapping repaired → ${canonicalByLabel.name}`);
+        continue;
+      }
+
+      if (byName && byName.rentalId && byName.rentalId !== rental.rentalId && !canonicalByLabel) {
+        summary.splitBrainConflicts++;
+        scheduleTermination(
+          rental.rentalId,
+          'split_brain_container_claimed',
+          'split_brain_container_claimed',
+          `Rental ${rental.rentalId} pointed at container ${byName.name}, but that container is labeled for ${byName.rentalId}.`
+        );
+        continue;
+      }
+
+      if (!byName && !canonicalByLabel) {
+        summary.missingContainers++;
+        const now = Date.now();
+        const missingSince = missingContainerSince.get(rental.rentalId) || now;
+        missingContainerSince.set(rental.rentalId, missingSince);
+        if (now - missingSince >= CONTAINER_MISSING_GRACE_MS) {
+          scheduleTermination(
+            rental.rentalId,
+            'container_missing',
+            'container_missing',
+            `Rental ${rental.rentalId} had no live Docker container after ${Math.round(CONTAINER_MISSING_GRACE_MS / 1000)}s grace; terminating stale active state.`
+          );
+        }
+        continue;
+      }
+
+      missingContainerSince.delete(rental.rentalId);
+    }
+
+    if (stateChanged) saveState(state);
+
+    for (const [rentalId, action] of terminations.entries()) {
+      summary.terminatedRentals++;
+      addAlert(state, rentalId, action.alertType, action.message);
+      endRental(state, rentalId, action.reason);
+    }
+
+    const refreshedState = loadState();
+    const refreshedRunningContainers = getRunningContainers();
+    const refreshedActiveRentals = Object.values(refreshedState.rentals || {}).filter(rental => rental.status === 'active');
+    const activeRentalIds = new Set(refreshedActiveRentals.map(rental => rental.rentalId));
+    const activeContainerNames = new Set(refreshedActiveRentals.map(rental => rental.containerName));
+    for (const rentalId of [...missingContainerSince.keys()]) {
+      if (!activeRentalIds.has(rentalId)) missingContainerSince.delete(rentalId);
+    }
+
+    for (const container of refreshedRunningContainers) {
+      const matched = (container.rentalId && activeRentalIds.has(container.rentalId)) || activeContainerNames.has(container.name);
+      if (matched) continue;
+
+      summary.orphanContainers++;
+      addAlert(state, container.rentalId || container.name, 'orphan_container', `Container ${container.name} was running without an active rental record; killing orphan.`);
+      killContainer(container.id);
+      summary.killedOrphans++;
+    }
+
+    lastContainerReconcile = summary;
+  } finally {
+    reconcileInFlight = false;
+  }
 }
 
 function updateRentalCost(state, rentalId, cost, interactions) {
   const rental = state.rentals[rentalId];
   if (!rental) return;
-  rental.costAccrued = cost;
-  rental.interactionCount = interactions;
-  
+  // Accumulate — bot sends per-interaction deltas
+  rental.costAccrued = (rental.costAccrued || 0) + Number(cost || 0);
+  rental.interactionCount = (rental.interactionCount || 0) + Number(interactions || 0);
+
   // Budget enforcement
-  if (cost >= rental.budgetCap) {
-    addAlert(state, rentalId, 'budget_exceeded', `Rental ${rentalId} exceeded budget cap ($${cost}/$${rental.budgetCap})`);
+  if (rental.costAccrued >= rental.budgetCap) {
+    addAlert(state, rentalId, 'budget_exceeded', `Rental ${rentalId} exceeded budget cap ($${rental.costAccrued.toFixed(4)}/$${rental.budgetCap})`);
     endRental(state, rentalId, 'budget_exceeded');
   }
   saveState(state);
+}
+
+function topupRental(state, rentalId, amount, txId = null, source = null) {
+  const rental = state.rentals[rentalId];
+  if (!rental) return { error: 'Rental not found' };
+  if (rental.status !== 'active') return { error: `Rental is ${rental.status}` };
+
+  const topupAmount = Number(amount || 0);
+  if (!(topupAmount > 0)) return { error: 'Invalid topup amount' };
+
+  rental.budgetCap = Number((rental.budgetCap + topupAmount).toFixed(4));
+  rental.topupCount = (rental.topupCount || 0) + 1;
+  rental.topupUsd = Number(((rental.topupUsd || 0) + topupAmount).toFixed(4));
+  rental.topups = rental.topups || [];
+  rental.topups.push({
+    at: new Date().toISOString(),
+    amount: topupAmount,
+    txId,
+    source,
+  });
+  if (rental.topups.length > 25) rental.topups = rental.topups.slice(-25);
+  saveState(state);
+
+  return {
+    ok: true,
+    rentalId,
+    budgetCap: rental.budgetCap,
+    topupCount: rental.topupCount,
+    topupUsd: rental.topupUsd,
+  };
 }
 
 function updateRentalModel(state, rentalId, model) {
@@ -229,12 +738,12 @@ function addAlert(state, rentalId, type, message) {
 // ── Aggregate Stats ─────────────────────────────────────────────────────────
 
 function getDashboardStats(state) {
-  const rentals = Object.values(state.rentals);
+  const rentals = Object.values(state.rentals || {});
   const active = rentals.filter(r => r.status === 'active');
-  const terminated = rentals.filter(r => r.status === 'terminated');
-  const totalCost = rentals.reduce((sum, r) => sum + r.costAccrued, 0);
-  const totalInteractions = rentals.reduce((sum, r) => sum + r.interactionCount, 0);
-  const unackedAlerts = state.alerts.filter(a => !a.acknowledged);
+  const terminated = rentals.filter(r => r.status === 'terminated' || r.status === 'ended');
+  const totalCost = rentals.reduce((sum, r) => sum + (r.costAccrued || 0), 0);
+  const totalInteractions = rentals.reduce((sum, r) => sum + (r.interactionCount || 0), 0);
+  const unackedAlerts = (state.alerts || []).filter(a => !a.acknowledged);
 
   return {
     active: active.length,
@@ -252,8 +761,8 @@ function getDashboardStats(state) {
 
 function renderDashboard(state) {
   const stats = getDashboardStats(state);
-  const rentals = Object.values(state.rentals).sort((a, b) => 
-    (a.status === 'active' ? 0 : 1) - (b.status === 'active' ? 0 : 1) || 
+  const rentals = Object.values(state.rentals).sort((a, b) =>
+    (a.status === 'active' ? 0 : 1) - (b.status === 'active' ? 0 : 1) ||
     new Date(b.startedAt) - new Date(a.startedAt)
   );
 
@@ -426,7 +935,7 @@ function startServer() {
   const server = http.createServer((req, res) => {
     // Reload state on each request (allows external updates)
     state = loadState();
-    
+
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const method = req.method;
 
@@ -482,7 +991,7 @@ function startServer() {
     if (rentalMatch && method === 'GET') {
       const rental = state.rentals[rentalMatch[1]];
       if (!rental) return sendJSON(404, { error: 'Not found' });
-      
+
       // Enrich with live container stats if active
       let containerStats = null;
       if (rental.status === 'active') {
@@ -507,6 +1016,22 @@ function startServer() {
           const { cost, interactions } = JSON.parse(body);
           updateRentalCost(state, rentalMatch[1], cost, interactions);
           return sendJSON(200, { ok: true });
+        } catch (e) {
+          return sendJSON(400, { error: 'Invalid JSON' });
+        }
+      });
+      return;
+    }
+
+    const topupMatch = url.pathname.match(/^\/api\/rentals\/([^/]+)\/topup$/);
+    if (topupMatch && method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', () => {
+        try {
+          const { amount, txId, source } = JSON.parse(body);
+          const result = topupRental(state, topupMatch[1], amount, txId, source);
+          return sendJSON(result.error ? 400 : 200, result);
         } catch (e) {
           return sendJSON(400, { error: 'Invalid JSON' });
         }
@@ -575,7 +1100,11 @@ function startServer() {
 
     // API: Health
     if (url.pathname === '/api/health') {
-      return sendJSON(200, { status: 'ok', timestamp: new Date().toISOString() });
+      return sendJSON(200, {
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        containerReconcile: lastContainerReconcile,
+      });
     }
 
     // API: Config
@@ -608,6 +1137,11 @@ function startServer() {
     console.log(`   API:       http://localhost:${PORT}/api/stats`);
     console.log(`   HCS Topic: ${state.config.hcsTopicId}\n`);
   });
+
+  reapExpiredRentals();
+  reconcileContainerState();
+  setInterval(reapExpiredRentals, 15_000);
+  setInterval(reconcileContainerState, 15_000);
 }
 
 // ── CLI Mode ────────────────────────────────────────────────────────────────
@@ -626,7 +1160,7 @@ function runCLI() {
       console.log(`  Cost:         $${stats.totalCost}`);
       console.log(`  Interactions: ${stats.totalInteractions}`);
       console.log(`  Alerts:       ${stats.unackedAlerts} unacked\n`);
-      
+
       if (rentals.length > 0) {
         console.log('  Rentals:');
         for (const r of rentals) {
@@ -672,9 +1206,21 @@ function runCLI() {
 
 // ── Entry ───────────────────────────────────────────────────────────────────
 
+function preflight() {
+  const fails = [];
+  try { execSync('docker info', { stdio: 'ignore', timeout: 5000 }); } catch { fails.push('Docker'); }
+  if (fails.length > 0) {
+    console.error(`\n❌ Preflight failed: ${fails.join(', ')}`);
+    console.error('Run: node scripts/atp-doctor.mjs for details\n');
+    process.exit(1);
+  }
+}
+
 const cliCommands = ['status', 'kill', 'create', 'alerts'];
 if (cliCommands.includes(process.argv[2])) {
   runCLI();
 } else {
+  preflight();
+  acquireLock();
   startServer();
 }

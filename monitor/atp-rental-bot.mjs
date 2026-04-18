@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 /**
- * ATP Rental Bot — @ATPRentalBot on Telegram
- * 
+ * ATP Rental Bot - @ATPRentalBot on Telegram
+ *
  * Handles user-facing commands for renting Aite's agent capabilities.
  * Works with deposit-watcher.mjs (detects payments) and atp-monitor.mjs (dashboard).
- * 
+ *
  * Commands:
- *   /start  — Welcome + intro
- *   /rent   — Start rental flow (get payment address)
- *   /status — Check active rental
- *   /help   — Command list
- * 
+ *   /start  - Welcome + intro
+ *   /rent   - Start rental flow (get payment address)
+ *   /status - Check active rental
+ *   /help   - Command list
+ *
  * Usage:
  *   node monitor/atp-rental-bot.mjs
  *   node monitor/atp-rental-bot.mjs --daemon  # Background mode
@@ -18,12 +18,22 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { execSync, spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createFundingIntent, listFundingIntents } from './funding-store.mjs';
 import { createRailIntent } from './funding-rails.mjs';
 
+function loadKeychainValue(service) {
+  try {
+    return execSync(`security find-generic-password -s ${service} -w`, { encoding: 'utf8', timeout: 5000 }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const BOT_TOKEN = process.env.RENTAL_BOT_TOKEN || '8527162069:AAG5Fg4iM8XatgEBeWj6UkQ2i00PGOypMng';
+const BOT_TOKEN = process.env.RENTAL_BOT_TOKEN || loadKeychainValue('rental-bot-token');
 const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const DEPOSIT_STATE = path.join(__dirname, 'deposit-state.json');
 const DEPOSIT_ACCOUNT = '0.0.10421318';
@@ -38,10 +48,12 @@ const POLL_INTERVAL = 2000; // 2s polling for updates
 const FULL_CAPABILITIES = ['web_search', 'web_fetch', 'image', 'exec', 'write'];
 const SUPPORTED_MODELS = ['haiku', 'sonnet', 'opus'];
 const RECOMMENDED_STARTER_USD = 5.00;
+const COMMAND_DEDUPE_MS = 4000;
 
 // ── State ───────────────────────────────────────────────────────────────────
 
 let offset = 0;
+const recentCommandTimestamps = new Map();
 
 function loadDepositState() {
   try {
@@ -161,6 +173,15 @@ async function send(chatId, text, opts = {}) {
   });
 }
 
+async function sendPlain(chatId, text, opts = {}) {
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text,
+    disable_web_page_preview: true,
+    ...opts
+  });
+}
+
 async function sendWithButtons(chatId, text, buttons) {
   return send(chatId, text, {
     reply_markup: {
@@ -194,6 +215,210 @@ async function answerCallback(callbackQueryId, text) {
 let cachedPrice = null;
 let priceTs = 0;
 
+function getUserLabel(from) {
+  return from.username || from.first_name || `user${from.id}`;
+}
+
+function getActiveRental(state, from, chatId) {
+  const username = getUserLabel(from);
+  const matches = (state.activatedRentals || []).filter(r => {
+    const sameUser = r.telegramChatId === chatId || r.renterName === username || r.renter === username;
+    const active = (!r.status || r.status === 'active') && (!r.expiresAt || r.expiresAt > Date.now());
+    return sameUser && active;
+  });
+
+  if (matches.length === 0) return null;
+
+  matches.sort((a, b) => {
+    const aTs = Date.parse(a.processedAt || a.activatedAt || a.timestamp || 0) || Number(a.expiresAt || 0) || 0;
+    const bTs = Date.parse(b.processedAt || b.activatedAt || b.timestamp || 0) || Number(b.expiresAt || 0) || 0;
+    return bTs - aTs;
+  });
+
+  return matches[0];
+}
+
+function extractJson(stdout) {
+  const raw = String(stdout || '').trim();
+  const idx = raw.indexOf('{');
+  if (idx === -1) throw new Error(raw || 'No JSON payload returned');
+  return JSON.parse(raw.slice(idx));
+}
+
+function extractPayloadText(payload) {
+  const payloads = payload?.payloads || payload?.result?.payloads || [];
+  const texts = payloads.map(item => item?.text).filter(Boolean);
+  if (texts.length > 0) return texts.join('\n\n').trim();
+  if (typeof payload?.text === 'string' && payload.text.trim()) return payload.text.trim();
+  if (typeof payload?.result?.text === 'string' && payload.result.text.trim()) return payload.result.text.trim();
+  return '';
+}
+
+const activatedSessions = new Set();
+
+function createFundingMemo() {
+  return `rent-${randomBytes(4).toString('hex')}`;
+}
+
+function isDuplicateCommand(chatId, fromId, text) {
+  if (!text.startsWith('/')) return false;
+  const now = Date.now();
+  const key = `${chatId}:${fromId}:${text.toLowerCase()}`;
+
+  for (const [entryKey, ts] of recentCommandTimestamps.entries()) {
+    if (now - ts > COMMAND_DEDUPE_MS) recentCommandTimestamps.delete(entryKey);
+  }
+
+  const previous = recentCommandTimestamps.get(key);
+  recentCommandTimestamps.set(key, now);
+  return typeof previous === 'number' && now - previous < COMMAND_DEDUPE_MS;
+}
+
+function buildActivationPrefix(rental) {
+  const budget = rental.budgetCapUsd || rental.depositUsd || '?';
+  const hbar = rental.depositHbar ? rental.depositHbar.toFixed(2) : '?';
+  const renter = rental.renter || rental.renterName || 'unknown';
+  return `[SYSTEM] Rental session is now ACTIVE. Renter: ${renter}. Payment: ${hbar} HBAR (~$${budget}). Full capabilities enabled. State is now active. Respond to the renter's messages directly - do not ask them to pay again.\n\nRenter says: `;
+}
+
+function isStopIntent(text) {
+  const lower = text.toLowerCase().trim();
+  const patterns = [
+    /^\/?stop$/,
+    /^\/?end\s*(rental|session|this)?[.!]?$/,
+    /^(please\s+)?(stop|end|terminate|cancel|quit|close)\s*(the\s+)?(rental|session|this)?[.!]?$/i,
+    /^i('m|\s+am)\s+done[.!]?$/i,
+  ];
+  return patterns.some(p => p.test(lower));
+}
+
+async function handleStop(chatId, from, rental) {
+  const rentalId = rental.rentalId;
+  console.log(`⏹ Stop requested by ${from.username || from.id} for rental ${rentalId}`);
+
+  try {
+    const res = await fetch(`${MONITOR_URL}/api/rentals/${rentalId}?reason=renter_terminated`, { method: 'DELETE' });
+    const data = await res.json();
+
+    if (data.error) {
+      await send(chatId, `⚠️ Could not end the rental: ${data.error}`);
+      return;
+    }
+
+    // Mark in deposit state
+    const state = loadDepositState();
+    const activated = (state.activatedRentals || []).find(r => r.rentalId === rentalId);
+    if (activated) {
+      activated.status = 'terminated';
+      activated.endedAt = new Date().toISOString();
+      activated.endReason = 'renter_terminated';
+      saveDepositState(state);
+    }
+    activatedSessions.delete(`atp-rental-${chatId}`);
+
+    const cost = data.costAccrued || activated?.costAccrued || 0;
+    const interactions = data.interactionCount || activated?.interactionCount || 0;
+    const deposit = activated?.depositUsd || activated?.budgetCapUsd || rental.budgetCapUsd || 0;
+    const remaining = Math.max(0, deposit - cost);
+
+    await send(chatId,
+`🛑 *Rental ended*
+
+Interactions: ${interactions}
+Cost: $${cost.toFixed(4)}
+Deposit: $${deposit.toFixed(2)}
+Remaining: $${remaining.toFixed(4)}
+
+A verifiable receipt has been logged to HCS.
+Thank you for renting Aite!`);
+  } catch (err) {
+    console.error('Stop handler error:', err.message);
+    await send(chatId, `⚠️ Error ending rental: ${err.message}`);
+  }
+}
+
+function extractUsageFromPayload(payload) {
+  const meta = payload?.meta || payload?.result?.meta || {};
+  const agentMeta = meta?.agentMeta || {};
+  const usage = agentMeta?.usage || agentMeta?.lastCallUsage || {};
+  const inputTokens = usage.input || usage.prompt_tokens || 0;
+  const outputTokens = usage.output || usage.completion_tokens || 0;
+  const model = agentMeta?.model || '';
+
+  // Rough cost estimation per model
+  let costUsd = 0;
+  const totalTokens = inputTokens + outputTokens;
+  if (model.includes('gpt-5')) {
+    costUsd = (inputTokens * 2.5 + outputTokens * 10) / 1_000_000;
+  } else if (model.includes('opus')) {
+    costUsd = (inputTokens * 5 + outputTokens * 25) / 1_000_000;
+  } else if (model.includes('sonnet')) {
+    costUsd = (inputTokens * 3 + outputTokens * 15) / 1_000_000;
+  } else if (model.includes('haiku')) {
+    costUsd = (inputTokens * 0.25 + outputTokens * 1.25) / 1_000_000;
+  } else {
+    costUsd = (inputTokens * 2.5 + outputTokens * 10) / 1_000_000;
+  }
+
+  return { inputTokens, outputTokens, totalTokens, costUsd, model };
+}
+
+async function reportUsageToMonitor(rentalId, costUsd, interactionDelta = 1) {
+  try {
+    await fetch(`${MONITOR_URL}/api/rentals/${rentalId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cost: costUsd, interactions: interactionDelta })
+    });
+  } catch (err) {
+    console.error(`Failed to report usage for ${rentalId}: ${err.message}`);
+  }
+}
+
+function runRentalRuntime(rental, chatId, text) {
+  if (!rental?.containerName) throw new Error('No rental container is attached to this session yet.');
+
+  const sessionId = `atp-rental-${chatId}`;
+  let message = text;
+  if (!activatedSessions.has(sessionId)) {
+    message = buildActivationPrefix(rental) + text;
+    activatedSessions.add(sessionId);
+  }
+
+  const result = spawnSync(
+    'docker',
+    [
+      'exec',
+      '-e', 'NODE_OPTIONS=--max-old-space-size=384',
+      rental.containerName,
+      'openclaw',
+      'agent',
+      '--session-id', sessionId,
+      '--message', message,
+      '--json',
+      '--timeout', '90'
+    ],
+    { encoding: 'utf8', timeout: 120000 }
+  );
+
+  const combined = `${result.stdout || ''}${result.stderr || ''}`.trim();
+  if (result.status !== 0) {
+    throw new Error(combined || `Rental runtime exited with status ${result.status}`);
+  }
+
+  const payload = extractJson(result.stdout || combined);
+  const replyText = extractPayloadText(payload);
+  if (!replyText) throw new Error('Rental runtime returned no reply text.');
+
+  // Track usage
+  const usage = extractUsageFromPayload(payload);
+  if (rental.rentalId && usage.costUsd > 0) {
+    reportUsageToMonitor(rental.rentalId, usage.costUsd, 1);
+  }
+
+  return replyText;
+}
+
 async function getHbarPrice() {
   if (cachedPrice && Date.now() - priceTs < 300_000) return cachedPrice;
   try {
@@ -212,22 +437,19 @@ async function getHbarPrice() {
 async function handleStart(chatId, from) {
   const name = from.first_name || 'there';
   await send(chatId,
-`👋 Hey ${name}! I'm *Aite* — an OpenClaw AI Agent.
+`👋 Hey ${name}! I'm *Aite* - an OpenClaw AI Agent.
 
 I'm available for rent, and I'm built for more than just chat. What do you need done?
 
-You’ll receive a verifiable receipt of activity when the session ends. Actions remain private.
+You'll receive a verifiable receipt of activity when the session ends. Actions remain private.
 
 Use /rent to get started or /help for commands.`
   );
 }
 
 async function handleRent(chatId, from) {
-  const hbarPrice = await getHbarPrice();
-  const starterHbarAmount = (RECOMMENDED_STARTER_USD / hbarPrice).toFixed(2);
   const username = from.username || from.first_name || `user${from.id}`;
-  const safeName = String(username).toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 12) || `u${from.id}`;
-  const memo = `rent-${safeName}-${Date.now().toString().slice(-6)}`;
+  const memo = createFundingMemo();
 
   const state = loadDepositState();
   state.pendingDeposits = state.pendingDeposits || {};
@@ -259,20 +481,18 @@ async function handleRent(chatId, from) {
 To begin, select your payment method.
 
 Your *deposit becomes your budget*.
-Pricing changes with actual usage and model burn. You can *change models during the session*.
-
-Starter suggestion: *${starterHbarAmount} HBAR* (~$${RECOMMENDED_STARTER_USD.toFixed(2)})
+Starter budget: *$${RECOMMENDED_STARTER_USD.toFixed(2)}*
 *Micro flash rentals also available.*
 You can send more if you want a larger budget.
 
 ⏳ Once your payment is detected (usually within 30 seconds), your session will activate automatically.
 
-_Current HBAR price: $${hbarPrice.toFixed(4)}_
 _Payment is monitored automatically_`,
     [
       [{ text: 'Pay with HBAR', callback_data: `pay_hbar:${memo}` }],
       [{ text: 'Pay with Crypto', callback_data: `pay_crypto_menu:${fundingIntent.intentId}` }],
-      [{ text: 'Pay with Cash', callback_data: `pay_cash:${fundingIntent.intentId}` }],
+      [{ text: 'PayPal', callback_data: `pay_paypal:${fundingIntent.intentId}` }, { text: 'Venmo', callback_data: `pay_venmo:${fundingIntent.intentId}` }],
+      [{ text: 'Pay with Card (Coinbase)', callback_data: `pay_cash:${fundingIntent.intentId}` }],
     ]
   );
 }
@@ -296,8 +516,7 @@ Model: ${r.modelPreference || 'inherits current Aite model until changed'}
 Remaining: ${remaining} minutes
 Capabilities: ${FULL_CAPABILITIES.join(', ')}
 
-_You can ask to change models during the session._
-_You’ll receive a verifiable receipt of activity when the session ends._`
+_You'll receive a verifiable receipt of activity when the session ends._`
     );
     return;
   }
@@ -340,20 +559,20 @@ async function handleHelp(chatId) {
   await send(chatId,
 `📋 *Commands*
 
-/start — Introduction
-/rent — Start a rental
-/status — Check your rental status
-/model — Show current or supported models
-/model <name> — Change model preference (haiku, sonnet, opus)
-/help — This message
+/start - Introduction
+/rent - Start a rental
+/status - Check your rental status
+/model - Show current or supported models
+/model <name> - Change model preference (haiku, sonnet, opus)
+/help - This message
 
 *How it works:*
 1. Use /rent to get the payment address and memo
 2. Send HBAR to fund your budget
 3. Your deposit becomes your session budget
 4. Pricing changes with actual usage and model burn
-5. You can change models during the session
-6. You’ll receive a verifiable receipt of activity when the session ends. Actions remain private`
+5. Use /stop to end your session
+6. You'll receive a verifiable receipt of activity when the session ends. Actions remain private`
   );
 }
 
@@ -445,16 +664,18 @@ With memo:
 \`${memo}\`
 
 Your *deposit becomes your budget*.
-Pricing changes with actual usage and model burn. You can *change models during the session*.
+Pricing changes with actual usage and model burn.
 
-Starter suggestion: *${starterHbarAmount} HBAR* (~$${RECOMMENDED_STARTER_USD.toFixed(2)})
+Suggested deposit: *${starterHbarAmount} HBAR* (~$${RECOMMENDED_STARTER_USD.toFixed(2)})
 *Micro flash rentals also available.*
 You can send more if you want a larger budget.
 
 ⏳ Once your payment is detected (usually within 30 seconds), your session will activate automatically.
 
+If your wallet does not support memo-aware QR scanning, scan the address QR and enter the memo manually exactly as shown above.
+
 _Payment is monitored automatically_`);
-      await sendQr(chatId, `${DEPOSIT_ACCOUNT}|${memo}`, 'QR for HBAR payment');
+      await sendQr(chatId, `${DEPOSIT_ACCOUNT}`, 'QR for HBAR payment address only. Enter the memo manually if your wallet does not import it.');
       return;
     }
 
@@ -487,10 +708,10 @@ Choose the asset you want to use. Your rental will activate when funding complet
           await send(chatId,
 `🪙 *Crypto payment ready*
 
-Send *${meta.expectedSourceAmount} ${intent.sourceAsset}* on *${intent.sourceChain}* to get started:
+Send a minimum of *${meta.expectedSourceAmount} ${intent.sourceAsset}* on *${intent.sourceChain}* to get started:
 \`${meta.hotWalletAddress}\`
 
-Your rental will activate from ATP hot-wallet liquidity once payment is detected.`);
+Your rental will activate when funding completes.`);
           await sendQr(chatId, meta.hotWalletAddress, 'QR for crypto payment');
         } else {
           await send(chatId,
@@ -509,6 +730,28 @@ Status updates are tracked automatically and your rental will activate when fund
       return;
     }
 
+    if ((data.startsWith('pay_paypal:') || data.startsWith('pay_venmo:')) && chatId) {
+      const isVenmo = data.startsWith('pay_venmo:');
+      const intentId = data.split(':')[1];
+      const optionKey = isVenmo ? 'venmo' : 'paypal';
+      await answerCallback(cq.id, `Creating ${isVenmo ? 'Venmo' : 'PayPal'} checkout...`);
+      try {
+        const intent = await createRailIntent(intentId, optionKey, DEPOSIT_ACCOUNT);
+        const meta = intent?.metadata || {};
+        if (!meta.paypalApprovalUrl) throw new Error(`${isVenmo ? 'Venmo' : 'PayPal'} checkout is not configured`);
+        await send(chatId,
+`${isVenmo ? '🟣' : '💳'} *Pay with ${isVenmo ? 'Venmo' : 'PayPal'}*
+
+Complete your $${(intent.targetBudgetUsd || 5).toFixed(2)} payment here:
+${meta.paypalApprovalUrl}
+
+Your rental will activate automatically after payment is confirmed.`);
+      } catch (e) {
+        await send(chatId, `Could not create the ${isVenmo ? 'Venmo' : 'PayPal'} checkout right now: ${e.message}`);
+      }
+      return;
+    }
+
     if (data.startsWith('pay_cash:') && chatId) {
       const intentId = data.split(':')[1];
       await answerCallback(cq.id, 'Creating checkout link...');
@@ -517,7 +760,7 @@ Status updates are tracked automatically and your rental will activate when fund
         const meta = intent?.metadata || {};
         if (!meta.onrampUrl) throw new Error('cash checkout provider is not configured');
         await send(chatId,
-`💵 *Pay with Cash / Card*
+`💵 *Pay with Card (Coinbase)*
 
 Complete checkout here:
 ${meta.onrampUrl}
@@ -539,23 +782,50 @@ This checkout funds your rental budget automatically. Once payment clears and co
   const chatId = msg.chat.id;
   const from = msg.from;
   const text = msg.text.trim();
+  const state = loadDepositState();
+  const activeRental = getActiveRental(state, from, chatId);
 
   console.log(`← command from chat ${chatId}: ${text}`);
+
+  if (isDuplicateCommand(chatId, from?.id, text)) {
+    console.log(`↺ Duplicate command suppressed for chat ${chatId}: ${text}`);
+    return;
+  }
 
   if (text === '/start') return handleStart(chatId, from);
   if (text === '/rent') return handleRent(chatId, from);
   if (text === '/status') return handleStatus(chatId, from);
+  if (text === '/stop' || text === '/end') {
+    if (activeRental) return handleStop(chatId, from, activeRental);
+    await send(chatId, `No active rental to end.`);
+    return;
+  }
   if (text === '/help') return handleHelp(chatId);
   if (text === '/model' || text.startsWith('/model ')) return handleModel(chatId, from, text);
 
-  // Unknown message — gentle nudge
   if (text.startsWith('/')) {
     await send(chatId, `Unknown command. Try /help for available commands.`);
     return;
   }
 
+  // Natural language stop detection
+  if (activeRental && isStopIntent(text)) {
+    return handleStop(chatId, from, activeRental);
+  }
+
+  if (activeRental) {
+    try {
+      const reply = runRentalRuntime(activeRental, chatId, text);
+      await sendPlain(chatId, reply);
+    } catch (err) {
+      console.error('Rental runtime forward failed:', err.message);
+      await sendPlain(chatId, `⚠️ Agent failed before reply: ${err.message}`);
+    }
+    return;
+  }
+
   await send(chatId,
-`👋 I’m here.
+`👋 I'm here.
 
 Try one of these:
 - /start

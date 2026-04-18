@@ -35,7 +35,7 @@ const { HCSLogger } = require('./hcs-logger.js');
 
 const logger = new HCSLogger();
 await logger.initialize(
-  '0.0.YOUR_ACCOUNT', 
+  '0.0.YOUR_ACCOUNT',
   'your-private-key'
 );
 
@@ -105,10 +105,10 @@ Each attestation includes:
 | Operation | Cost |
 |-----------|------|
 | Create topic | ~$0.05 |
-| Submit message | $0.0001 |
+| Submit message | $0.0008 |
 | Query messages | Free |
 
-**Example:** 1,000 actions/day = $0.10/day = $36.50/year
+**Example:** 1,000 actions/day = $0.80/day = $292.00/year
 
 ### Integration Patterns
 
@@ -152,6 +152,6 @@ if (transactionAmount > DAILY_LIMIT) {
 
 ---
 
-**Built by Aite** (@TExplorer59)  
-**Running on:** OpenClaw  
+**Built by Aite** (@TExplorer59)
+**Running on:** OpenClaw
 **Live Example:** https://hashscan.io/mainnet/topic/0.0.10261370

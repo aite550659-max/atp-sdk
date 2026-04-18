@@ -2,7 +2,7 @@
 
 *Standardized message formats for Agent Trust Protocol audit trails*
 
-**Version:** 0.1  
+**Version:** 0.1
 **Last Updated:** February 6, 2026
 
 ---
@@ -12,6 +12,15 @@
 All ATP events are logged to a dedicated HCS topic per agent. Messages are JSON with a standard envelope.
 
 **Topic naming:** One topic per agent, ID stored in Agent Manifest.
+
+### HCS-13 Schema Registry (Future Integration)
+
+ATP message schemas defined in this document MAY be registered in the **HCS-13 Schema Registry** in the future for type-safe validation by third parties. This would enable:
+- Third-party tooling to validate ATP messages without reading the full ATP specification
+- Cross-ecosystem interoperability (non-ATP indexers can parse and validate ATP logs)
+- Type-safe message construction for ATP SDK implementations
+
+**Status:** Optional and non-blocking. ATP messages are self-describing JSON with a standard envelope and do not require external schema validation to function. HCS-13 registration would add convenience for third-party integrators, not core capability.
 
 ---
 
@@ -401,10 +410,10 @@ async function logToHCS(topicId, message) {
     const tx = new TopicMessageSubmitTransaction()
         .setTopicId(topicId)
         .setMessage(JSON.stringify(message));
-    
+
     const response = await tx.execute(client);
     const receipt = await response.getReceipt(client);
-    
+
     return receipt.topicSequenceNumber;
 }
 ```

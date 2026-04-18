@@ -5,6 +5,31 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STORE_PATH = path.join(__dirname, 'funding-state.json');
 
+function normalizeFundingState(state) {
+  const intents = state?.intents || {};
+  const byMemo = {};
+
+  for (const intent of Object.values(intents)) {
+    if (intent?.memo) byMemo[intent.memo] = intent.intentId;
+  }
+
+  const totalIntents = Object.keys(intents).length;
+  const totalActivated = Object.values(intents).filter(intent => {
+    if (intent?.status === 'active') return true;
+    return Array.isArray(intent?.history) && intent.history.some(entry => entry?.status === 'active');
+  }).length;
+
+  return {
+    intents,
+    byMemo,
+    stats: {
+      totalIntents,
+      totalActivated,
+    },
+    updatedAt: state?.updatedAt || new Date().toISOString(),
+  };
+}
+
 function defaultState() {
   return {
     intents: {},
@@ -17,20 +42,15 @@ function defaultState() {
 export function loadFundingState() {
   try {
     const data = JSON.parse(fs.readFileSync(STORE_PATH, 'utf8'));
-    return {
-      intents: data.intents || {},
-      byMemo: data.byMemo || {},
-      stats: data.stats || { totalIntents: 0, totalActivated: 0 },
-      updatedAt: data.updatedAt || new Date().toISOString()
-    };
+    return normalizeFundingState(data);
   } catch {
     return defaultState();
   }
 }
 
 export function saveFundingState(state) {
-  state.updatedAt = new Date().toISOString();
-  fs.writeFileSync(STORE_PATH, JSON.stringify(state, null, 2));
+  const normalized = normalizeFundingState({ ...state, updatedAt: new Date().toISOString() });
+  fs.writeFileSync(STORE_PATH, JSON.stringify(normalized, null, 2));
 }
 
 export function createFundingIntent(input) {
@@ -87,6 +107,7 @@ export function updateFundingIntent(intentId, patch = {}, note = '') {
   if (!intent) return null;
 
   const previousMemo = intent.memo;
+  const previousStatus = intent.status;
   const mergedPatch = { ...patch };
   if (patch.metadata) {
     mergedPatch.metadata = { ...(intent.metadata || {}), ...patch.metadata };
@@ -101,9 +122,10 @@ export function updateFundingIntent(intentId, patch = {}, note = '') {
 
   if (patch.status) {
     intent.history = intent.history || [];
-    intent.history.push({ at: new Date().toISOString(), status: patch.status, note: note || patch.status });
-    if (patch.status === 'active') {
-      state.stats.totalActivated = (state.stats.totalActivated || 0) + 1;
+    const nextNote = note || patch.status;
+    const last = intent.history[intent.history.length - 1];
+    if (!last || last.status !== patch.status || last.note !== nextNote || previousStatus !== patch.status) {
+      intent.history.push({ at: new Date().toISOString(), status: patch.status, note: nextNote });
     }
   }
   saveFundingState(state);

@@ -1,0 +1,139 @@
+# ATP repo hygiene
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Dependencies / build
+node_modules/
+**/node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Python / local envs
+.venv/
+.venv_excel/
+__pycache__/
+*.pyc
+
+# Local OpenClaw workspace state
+.openclaw/
+.agents/
+.clawhub/
+memory/
+logs/
+artifacts/
+repos/
+projects/
+ventures/
+skills/
+val-web/
+verifiable-agent-log/
+coinbase-agentkit-pr/
+agents/
+data/
+integrations/
+packages/val/
+tasks/
+drafts/
+docs/private/
+
+# Private bootstrap / persona files
+AGENTS.md
+SOUL.md
+USER.md
+MEMORY.md
+HEARTBEAT.md
+SERVICES.md
+TOOLS.md
+IDENTITY.md
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+.hedera-env
+docker/.env
+contracts/testnet-key.json
+coinbase-cdp.json
+cdp-private-key.pem
+*.pem
+
+# Wallets / keys / local chain state
+wallets.json
+wallets_backup_*.json
+all-tps-wallets.json
+local-tps-wallets.json
+testnet-wallet.json
+tps-batch3-wallets.json
+tps-ec2-wallets*.json
+tps-ec2-all-wallets.json
+data/wallets.json
+
+# Local runtime state
+monitor/*.lock
+monitor/*state.json
+monitor/*state-archive-*.json
+*.log
+relay.log
+voice-server.log
+
+# Generated benchmark / experiment output
+fast_burst_results_*.json
+mixed_tps_*.json
+hcs_sustained_result_*.json
+presigned_hcs_result_*.json
+peak_tps_results_*.json
+easter_egg_payment_results.json
+hedera_tps_test_results.json
+tps_test_transactions.csv
+test-image-*.png
+Hedera_Network_Statistics_Feb_2026.pptx
+ec2*-burst*.json
+local-burst*.json
+hcs_sustained_*.json
+hcs_sustained_runner.js
+presigned_hcs_sustained.js
+
+# One-off benchmark / experiment scripts
+hedera_fast_burst*.js
+hedera_peak_tps.js
+hedera_sustained_tps.js
+hedera_tps_*.js
+mixed_tps_blast.js
+mixed_tps_runner.js
+mixed_tps_submitter.js
+stake_*.js
+create_wallets.js
+create-vai-mainnet.js
+create_hedera_pptx.py
+create_hedera_slides.js
+
+# Workspace-only docs / HTML / misc
+ATP_CODE_REVIEW.md
+AUTONOMOUS_MODE.md
+GOALS.md
+TODO_PRIORITY.md
+clawhub-skills-analysis.md
+research_clawcredit_neutron.md
+aite-hq.html
+dashboard.html
+hcs-viewer.html
+hcs-messenger-config.json
+midjourney-prompt.txt
+moltlist/
+voice-server.js
+hedera-agentkit/
+val-openclaw-plugin/
+
+# Out of scope for first public ATP sync unless explicitly reviewed
+assets/
+bin/
+config/
+deploy/
+knowledge/
+lib/
+easter_egg_payments.js
+wallets.json.template

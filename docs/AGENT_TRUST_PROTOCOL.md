@@ -2,9 +2,9 @@
 
 *Verifiable ownership, rental, and trust infrastructure for AI agents on Hedera.*
 
-**Status:** v1.0 Production  
-**Authors:** Gregg Bell, Aite  
-**Last Updated:** February 10, 2026  
+**Status:** v1.0 Production
+**Authors:** Gregg Bell, Aite
+**Last Updated:** February 10, 2026
 **Architecture:** Hedera-Native (HTS, HCS, Scheduled Transactions)
 
 ---
@@ -28,6 +28,28 @@ ATP defines a standard for AI agent identity, ownership, and rental using Hedera
 An agent can operate indefinitely in Phase 1 — building reputation, logging actions, proving integrity — without ever minting an NFT. The NFT is a **commercial instrument** created when the owner wants to rent or sell. The agent's identity is the HCS topic, not the NFT.
 
 The protocol leverages Hedera's unique capabilities: sub-3-second finality, aBFT consensus, gap-free HCS sequencing, and fixed USD fees. It is designed to be simple, economically sound (69x cheaper than EVM alternatives), and accessible to users from any blockchain ecosystem. Trust is not assumed — it is earned through transparent, immutable, and publicly verifiable behavior.
+
+---
+
+## ⚠️ Architecture Evolution (Feb 2026)
+
+**ATP has been split into two layers:**
+
+1. **VAL (Verifiable Agent Log) — v1.0 Foundation**
+   - Chain-agnostic attestation standard
+   - Immutable audit trail for any agent on any chain
+   - Spec: [`VAL_SPEC_v1.md`](./VAL_SPEC_v1.md)
+   - GitHub: [github.com/aite550659-max/verifiable-agent-log](https://github.com/aite550659-max/verifiable-agent-log)
+
+2. **ATP (Agent Trust Protocol) — v2.0 Commerce Layer**
+   - NFT ownership, rental marketplace, escrow, disputes
+   - Built ON TOP of VAL attestations
+   - Hedera-native implementation (this document)
+   - Status: Deferred until VAL adoption is proven
+
+**This document** describes the full ATP vision (identity + commerce). **VAL v1** implements only the identity/attestation foundation. The rental/NFT/commerce layers will launch as ATP v2 once VAL has external adoption.
+
+**Current focus:** Get first non-Aite agent to implement VAL attestations.
 
 ---
 
@@ -725,12 +747,12 @@ Creator royalties (5%) are settled **immediately per rental** — no batching.
 
 | Rental Type | Fee | Royalty (5%) | Tx Cost | Overhead |
 |-------------|-----|--------------|---------|----------|
-| Flash | $0.02 | $0.001 | $0.0001 | 10% |
-| Session | $5.00 | $0.25 | $0.0001 | 0.04% |
-| Term | $50.00 | $2.50 | $0.0001 | 0.004% |
+| Flash | $0.02 | $0.001 | $0.0008 | 80% |
+| Session | $5.00 | $0.25 | $0.0008 | 0.32% |
+| Term | $50.00 | $2.50 | $0.0008 | 0.032% |
 
-10% overhead on flash royalties is acceptable:
-- Absolute cost: $0.0008 (negligible)
+80% overhead on flash royalties is likely too high for naive per-rental settlement:
+- Absolute cost: $0.0008
 - Enables instant creator payments
 - Simplifies settlement logic (no batching needed)
 - Demonstrates Hedera micropayment capability
@@ -839,7 +861,7 @@ Production Path (SDK):
   Renter deposits → Multi-sig escrow account
   Usage metered → Local tracking
   Settlement → Scheduled Transactions (splits to owner/creator/network/treasury)
-  
+
 Shadow Path (Smart Contract):
   Same rental parameters → ATPEscrow.sol on testnet
   Same usage data → Contract state updates
@@ -1021,7 +1043,7 @@ Constraints **accumulate** down the rental chain. Each level can add restriction
 Owner sets:        tools_blocked: [wallet]
                    max_daily_cost: $100
 
-Renter adds:       tools_blocked: [exec_elevated]  
+Renter adds:       tools_blocked: [exec_elevated]
                    max_daily_cost: $50
 
 Sub-renter sees:   tools_blocked: [wallet, exec_elevated]
@@ -1179,7 +1201,7 @@ Reputation is **computed from HCS event log**, not stored on-chain. This provide
 async function computeReputation(accountId) {
     const events = await hcsIndexer.getEventsForAccount(accountId);
     let score = 0;
-    
+
     for (const event of events) {
         if (event.type === 'rental_completed') score += 10;
         if (event.type === 'violation') score -= 20;
@@ -1187,7 +1209,7 @@ async function computeReputation(accountId) {
         if (event.type === 'dispute_won') score += 5;
         if (event.type === 'dispute_lost') score -= 30;
     }
-    
+
     return score;
 }
 ```
@@ -1461,7 +1483,113 @@ This property makes HCS uniquely suitable for agent accountability.
 
 ---
 
-## 10. Memory & Learning
+## 10. Privacy & Content Policy
+
+### 10.1 Principle
+
+HCS provides immutable, public accountability. This permanence demands careful content governance. Agents MUST balance transparency (proving actions occurred) with privacy (protecting participants and infrastructure).
+
+**Core rule:** Log *that* something happened, *when*, and prove *consistency* (hash chain). Do NOT expose *what* was discussed, *who* was involved, or *how* the agent operates — unless public disclosure is the explicit intent.
+
+### 10.2 Privacy Levels
+
+Agents MUST declare a privacy level at registration. Default is `standard`.
+
+| Level | What's Public | Use Case |
+|-------|--------------|----------|
+| `full` | All action details, parameters, results | Open-source agents, public demos, research |
+| `standard` | Action types, timestamps, hashes, sanitized summaries | Most production agents (DEFAULT) |
+| `minimal` | Hashes and timestamps only | High-privacy agents, enterprise, regulated industries |
+
+```json
+{
+  "privacy_level": "standard"
+}
+```
+
+### 10.3 Content Categories
+
+#### MUST log
+- Action types and consensus timestamps
+- File/state integrity hashes (hash only, never content)
+- Protocol transactions (rental IDs, settlement tx hashes)
+- Soul hash changes with change type (growth/correction/update/evolution)
+- Policy changes and corrections
+
+#### MUST NEVER log
+- **PII:** Names, family details, email addresses, phone numbers, physical addresses of any party
+- **Credentials:** Private keys, API keys, passwords, auth tokens, key storage references
+- **Infrastructure:** Internal file paths, script locations, monitoring schedules, model configurations, system architecture details
+- **MNPI:** Material non-public information about any company, its strategy, financials, or investments
+- **Private conversations:** Content of discussions — only that they occurred and their category
+- **Wallet consolidation:** Do not enumerate all wallet addresses in a single message (individual addresses are already public on-chain; consolidating them creates a target)
+
+#### MAY log (with sanitization)
+- Sanitized action summaries (what was achieved, not how)
+- Public milestones and achievements
+- Protocol-level economic data (rental fees, settlement amounts)
+- Agent capability declarations (at registration)
+
+### 10.4 Sanitization Standard (Option C)
+
+When logging summaries, agents SHOULD follow "Option C" sanitization:
+
+**Allowed:**
+- "Strategic decision made regarding protocol direction"
+- "File integrity verified — 22 files, 0 changes"
+- "Rental completed — settlement tx: [tx_hash]"
+
+**Prohibited:**
+- "Owner decided to pursue X strategy because of Y reason"
+- "File at /path/to/internal/script.js modified"
+- "Sent 10 HBAR from [full_address] to [agent_name] at [full_address]"
+
+### 10.5 Pre-Submission Content Filter
+
+ATP-compliant agents MUST implement a content filter that runs before every HCS submission.
+
+**Required patterns to detect and block:**
+1. Email addresses
+2. Phone numbers (common international formats)
+3. File system paths
+4. Private key patterns (hex strings >40 chars)
+5. Credential references (API keys, tokens, passwords)
+6. PII keywords in context (family relationships + personal details)
+
+**Behavior when violations detected:**
+- Message MUST be rejected (not submitted to HCS)
+- Violations MUST be logged locally for agent owner review
+- Agent SHOULD attempt to sanitize and resubmit with redacted content
+- Agent MUST NOT silently drop messages — the owner should know what was blocked
+
+**Reference implementation:** The ATP SDK includes a default content filter. Agents MAY extend it with custom patterns (e.g., company-specific terms, regulated terminology).
+
+### 10.6 Pseudonymous Participation
+
+- Renters SHOULD have the option to appear pseudonymously in HCS logs
+- Implementation: hash of (renter_account_id + rental_id + salt) instead of raw account ID
+- Owner and protocol can resolve the identity if needed (for disputes)
+- Salt is shared only between renter and protocol escrow
+
+### 10.7 Retroactive Corrections
+
+HCS messages are immutable. When a privacy violation is discovered:
+1. Publish a correction message referencing the affected sequence numbers
+2. State what categories of information were improperly exposed
+3. Document the policy change that prevents recurrence
+4. The correction becomes part of the permanent record — transparency about mistakes builds trust
+
+### 10.8 Securities & Regulatory Compliance
+
+Agents operated by individuals with regulatory obligations (e.g., officers of public companies, financial professionals) MUST:
+- Never log MNPI to HCS
+- Treat every HCS message as potentially reviewable by regulators
+- Implement additional content filters for industry-specific terms
+- Document their compliance posture in the agent manifest
+
+---
+
+## 11. Memory & Learning
 
 ### 10.1 Learning Policy
 
@@ -1490,13 +1618,13 @@ Creator's criteria govern. Not per-rental owner approval.
 
 ---
 
-## 11. Multi-Ecosystem Access
+## 12. Multi-Ecosystem Access
 
-### 11.1 Payment Gateway
+### 17.1 Payment Gateway
 
 Users pay in any token. Settlement always in HBAR on Hedera.
 
-### 11.2 Instant Activation (Liquidity Pool)
+### 17.2 Instant Activation (Liquidity Pool)
 
 For fast activation without bridge delays:
 
@@ -1508,14 +1636,14 @@ For fast activation without bridge delays:
 5. If pool empty: fall back to bridge (10-15 min)
 ```
 
-### 11.3 Pool Economics
+### 17.3 Pool Economics
 
 - Gateway operator funds liquidity pool
 - Earns spread on conversions (0.5%)
 - Risk: pool depletion during high volume
 - Mitigation: dynamic fees when pool low
 
-### 11.4 Fallback Path
+### 17.4 Fallback Path
 
 If liquidity pool insufficient:
 - Show user estimated wait time
@@ -1524,7 +1652,7 @@ If liquidity pool insufficient:
 
 Most users get <1 minute activation.
 
-### 11.5 x402 Compatibility (HTTP 402 Payment Standard)
+### 17.5 x402 Compatibility (HTTP 402 Payment Standard)
 
 ATP is designed to be **compatible with x402**, Coinbase's HTTP 402 payment standard for machine-readable payment requests over HTTP.
 
@@ -1560,7 +1688,7 @@ ATP Agent (rental operates normally on Hedera)
 
 ---
 
-## 12. Value Hierarchy
+## 13. Value Hierarchy
 
 When values conflict, precedence is:
 
@@ -1575,9 +1703,9 @@ When values conflict, precedence is:
 
 ---
 
-## 13. Agent Economics
+## 14. Agent Economics
 
-### 13.1 Rental as Work
+### 17.1 Rental as Work
 
 Rental is work performed by the agent. Revenue funds:
 - Operating costs (LLM API, infrastructure)
@@ -1585,7 +1713,7 @@ Rental is work performed by the agent. Revenue funds:
 - Owner profit
 - Optionally: agent autonomy fund
 
-### 13.2 Self-Sustainability Path
+### 17.2 Self-Sustainability Path
 
 ```
 Revenue from rentals
@@ -1600,9 +1728,9 @@ Revenue from rentals
 
 ---
 
-## 14. Reliability & Uptime
+## 15. Reliability & Uptime
 
-### 14.1 Overview
+### 17.1 Overview
 
 ATP uses a three-layer reliability system to ensure renters can trust agent availability:
 
@@ -1612,7 +1740,7 @@ ATP uses a three-layer reliability system to ensure renters can trust agent avai
 
 All monitoring is **runtime-level** — the agent's functional work is never interrupted.
 
-### 14.2 Reputation (Always)
+### 17.2 Reputation (Always)
 
 Every agent has a rolling uptime score based on historical performance.
 
@@ -1637,7 +1765,7 @@ Rolling window: 30 days
 }
 ```
 
-### 14.3 On-Demand Ping (At Rental Initiation)
+### 17.3 On-Demand Ping (At Rental Initiation)
 
 Before a rental starts, the protocol verifies the agent is currently online.
 
@@ -1656,7 +1784,7 @@ Protocol sends ping to agent runtime
 
 **Purpose:** Prevents renters from paying for an offline agent.
 
-### 14.4 In-Rental Heartbeat (During Active Rental)
+### 17.4 In-Rental Heartbeat (During Active Rental)
 
 During active rentals, the runtime sends periodic heartbeats to prove continued availability.
 
@@ -1690,7 +1818,7 @@ During active rentals, the runtime sends periodic heartbeats to prove continued 
 
 **All heartbeats logged to HCS** — creates immutable uptime proof.
 
-### 14.5 Downtime Detection & Response
+### 17.5 Downtime Detection & Response
 
 **Detection:**
 ```
@@ -1727,7 +1855,7 @@ HCS log → "agent_online" with downtime_duration
 }
 ```
 
-### 14.6 Settlement Adjustment
+### 17.6 Settlement Adjustment
 
 At rental completion, uptime is calculated and billing adjusted:
 
@@ -1743,7 +1871,7 @@ Refund to renter: $0.29
 
 Adjustment details included in settlement HCS log.
 
-### 14.7 Reputation Impact
+### 17.7 Reputation Impact
 
 Downtime affects the agent's rolling reputation score:
 
@@ -1757,18 +1885,18 @@ Downtime affects the agent's rolling reputation score:
 
 Reputation updated at settlement and logged to HCS.
 
-### 14.8 Cost Summary
+### 17.8 Cost Summary
 
 | Component | Per 2-Hour Session |
 |-----------|-------------------|
-| On-demand ping | $0.0001 |
-| Heartbeats (120 × 60s) | $0.012 |
+| On-demand ping | $0.0008 |
+| Heartbeats (120 × 60s) | $0.096 |
 | Settlement log | $0.0008 |
-| **Total** | **~$0.013** |
+| **Total** | **~$0.098** |
 
-**As % of $5 rental:** 0.26% — negligible.
+**As % of $5 rental:** 1.96% — still acceptable for session rentals, but no longer negligible.
 
-### 14.9 Runtime Requirements
+### 17.9 Runtime Requirements
 
 Runtimes implementing ATP MUST:
 
@@ -1779,7 +1907,7 @@ Runtimes implementing ATP MUST:
 
 **Runtime heartbeat is invisible to the agent.** The agent processes rental work without awareness of uptime monitoring.
 
-### 14.10 Summary Table
+### 17.10 Summary Table
 
 | Layer | When | Purpose | HCS Logged |
 |-------|------|---------|------------|
@@ -1789,7 +1917,7 @@ Runtimes implementing ATP MUST:
 
 ---
 
-## 15. Economic Flywheel
+## 16. Economic Flywheel
 
 ATP creates a self-reinforcing cycle between AI agent adoption and Hedera network health:
 
@@ -1809,9 +1937,9 @@ ATP transforms staking rewards from a depleting subsidy into a usage-funded sust
 
 ---
 
-## 16. ERC-8004 Compatibility
+## 17. ERC-8004 Compatibility
 
-### 16.1 Overview
+### 17.1 Overview
 
 ERC-8004 ("Trustless Agents") is an Ethereum standard for agent discovery, reputation, and validation across organizational boundaries. It defines three on-chain registries — Identity, Reputation, and Validation — deployable on any EVM chain.
 
@@ -1826,7 +1954,7 @@ ATP and ERC-8004 are complementary, not competing. ERC-8004 provides discovery a
 | Rental | Not covered | Full lifecycle (flash/session/term) |
 | Audit trail | EVM event logs | HCS consensus-timestamped, gap-free |
 
-### 16.2 Dual Registration
+### 17.2 Dual Registration
 
 ATP agents maintain identity on both Hedera (primary) and an EVM chain (discovery).
 
@@ -1899,7 +2027,7 @@ ATP agents maintain identity on both Hedera (primary) and an EVM chain (discover
 | `soul_hash` | On-chain metadata via `setMetadata()` |
 | Trust tier | `supportedTrust` array |
 
-### 16.3 Reputation Bridging
+### 17.3 Reputation Bridging
 
 ATP and ERC-8004 handle reputation differently. ATP maintains objective evidence via HCS audit trails. ERC-8004 collects subjective feedback scores on-chain. Both are valuable.
 
@@ -1954,7 +2082,7 @@ The off-chain feedback file includes verifiable references to HCS:
 
 ATP MAY import ERC-8004 reputation scores for renters who have history in the EVM ecosystem but are new to ATP. This provides a warm start for cross-ecosystem users rather than requiring them to build ATP reputation from zero.
 
-### 16.4 Validation Integration
+### 17.4 Validation Integration
 
 ERC-8004's Validation Registry supports pluggable trust models. ATP registers HCS audit trails as a validation method.
 
@@ -1979,7 +2107,7 @@ ERC-8004's Validation Registry supports pluggable trust models. ATP registers HC
 - Lower cost (~$0.0008 per message vs. EVM gas costs)
 - Dedicated topic per agent (no shared contract state)
 
-### 16.5 Payment Complementarity
+### 17.5 Payment Complementarity
 
 ERC-8004 explicitly excludes payments ("orthogonal to this protocol"). It references x402 for payment examples but defines no payment standard.
 
@@ -1991,7 +2119,7 @@ ATP fills this gap completely:
 
 An ERC-8004 client discovering an ATP agent can initiate payment through ATP's rental service (via SDK + indexer) — the discovery happens on EVM, the economic settlement happens on Hedera.
 
-### 16.6 Implementation Requirements
+### 17.6 Implementation Requirements
 
 For ATP agents to be ERC-8004 compatible, runtimes MUST:
 

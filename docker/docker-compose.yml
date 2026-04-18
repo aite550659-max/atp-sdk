@@ -1,0 +1,64 @@
+# ATP Rental Agent — Docker Compose
+# Usage: docker compose -f docker/docker-compose.yml up -d
+
+services:
+  rental-agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: atp-rental
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "18790:18790"  # Gateway API (for sidecar/monitoring only)
+    # ── Security hardening ────────────────────────────────────────────────
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=100M
+      - /home/rental/.openclaw/workspace/memory:size=50M  # Agent can write memory, but it's ephemeral
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW  # Needed for DNS resolution
+    # ── Resource limits ───────────────────────────────────────────────────
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    # ── Network isolation ─────────────────────────────────────────────────
+    networks:
+      - rental-net
+    # ── No host filesystem access ─────────────────────────────────────────
+    # No volumes mounted. Container is fully isolated.
+
+  # Optional: HCS sidecar for on-chain logging
+  hcs-sidecar:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.sidecar
+    container_name: atp-sidecar
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      rental-agent:
+        condition: service_healthy
+    networks:
+      - rental-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+networks:
+  rental-net:
+    driver: bridge
+    internal: false  # Needs internet for Telegram/Anthropic/Hedera APIs

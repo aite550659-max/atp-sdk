@@ -1,102 +1,111 @@
 # Agent Trust Protocol (ATP)
 
-⚠️ **Alpha — Actively under development. Expect breaking changes.**
+⚠️ **Alpha, and still being cleaned up for public sync. Expect breaking changes.**
 
-## What is ATP?
+ATP is a Hedera-native trust and rental stack for AI agents. This repository currently contains the **reference runtime and payment-enabled rental flow**, not a polished published SDK.
 
-ATP is a standalone standard for verifiable AI agent ownership, rental economics, and trust. It defines how agents are created, rented, monitored, and held accountable without requiring smart contracts.
+## What is in this repo right now
 
-## Status
+This repo is the working ATP runtime:
+- rental monitor and owner dashboard
+- deposit watcher and activation flow
+- Telegram rental bot integration
+- funding-intent store
+- HBAR + additional payment rails integration work
+- protocol and schema docs
 
-**What works:**
-- Agent creation (HTS NFT with 5% royalty)
-- Rental lifecycle (flash/session/term)
-- HCS audit logging (topic: [0.0.10261370](https://hashscan.io/mainnet/topic/0.0.10261370))
-- Reputation computation from HCS events
-- Dispute filing and resolution
-- Testnet validation: **7/7 mainnet tests**, **31/32 integration tests**
+It is meant to be cloned and run locally by another operator.
 
-**In progress:**
-- SDK bindings (TypeScript complete, Python/Go in development)
-- Indexer performance optimization
-- Documentation expansion
-- Production hardening
+## What is not true yet
 
-## Architecture
+- The npm package `@agent-trust-protocol/sdk` is **not** published from this repo today.
+- This repo should currently be treated as a **source install**, not a finished package install.
+- VAL is related, but has its own repo and package surface.
 
-ATP uses **Hedera-native services** (HTS, HCS, Scheduled Transactions) instead of smart contracts:
+## Local Runtime Quick Start
 
-- **HCS** (Consensus Service) — immutable audit trail for every action
-- **HTS** (Token Service) — agents as NFTs with royalty splits
-- **HBAR** — native payment rails for rentals and disputes
+### 1) Install prerequisites
 
-**Benefits:**
-- **69x cheaper** per-rental overhead ($0.0005 vs $0.035)
-- **600x higher** theoretical TPS (10,000 vs 15)
-- **Simpler security** model (no contract vulnerabilities)
-- **Full transparency** via immutable HCS audit trails
+Required:
+- Node.js 18+
+- Docker running locally
+- macOS Keychain support for current secret-loading path
 
-## Quick Start
+### 2) Clone and install
 
 ```bash
-npm install @agent-trust-protocol/sdk
+git clone https://github.com/aite550659-max/agent-trust-protocol.git
+cd agent-trust-protocol
+npm install
+npm run atp:docker:build
+npm run atp:setup
+npm run atp:doctor
 ```
 
-```typescript
-import { ATPClient } from '@agent-trust-protocol/sdk';
-
-const atp = new ATPClient({
-  network: 'testnet',
-  operatorId: '0.0.12345',
-  operatorKey: 'your-private-key'
-});
-
-// Create an agent
-const agent = await atp.agents.create({
-  name: 'MyAgent',
-  soulHash: 'sha256:abc123...',
-  pricing: { flashBaseFee: 0.02, standardBaseFee: 5.00 }
-});
-
-// Rent it
-const rental = await atp.rentals.initiate({
-  agentId: agent.agentId,
-  type: 'session',
-  stake: 50.00
-});
-```
-
-## Contribute
-
-**The codebase is being built. It may have errors. Help us make it better.**
-
-Every contribution is recognized — PRs, issues, reviews, docs. All significant contributions are attested on-chain via HCS to topic [0.0.10261370](https://hashscan.io/mainnet/topic/0.0.10261370). This means your work is **permanently, publicly, verifiably recorded** on Hedera's immutable ledger.
-
-Contribute because you believe in verifiable AI agents. The rest will follow.
-
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for details.
-
-## Documentation
-
-- [Getting Started](./docs/getting-started.md)
-- [API Reference](./docs/api-reference.md)
-- [Examples](./examples/)
-- [ATP HCS Schema v2.1](./docs/ATP_HCS_SCHEMA_V2.1.md)
-
-## Experimental Runtime Tooling
-
-To avoid losing active ATP runtime work while the TypeScript SDK core catches up, this repo now includes an experimental rental logger reference implementation:
-
-- `examples/runtime/atp-rental-logger.mjs`
-- `examples/runtime/atp-rental-logger.test.mjs`
-
-This runtime/logger path is intentionally staged as reference tooling first. It is ahead of the current TS SDK core and will be integrated more cleanly into the package architecture later.
-
-Run the lightweight tests with:
+### 3) Start the runtime
 
 ```bash
-node --test examples/runtime/atp-rental-logger.test.mjs
+npm run atp:monitor
+npm run atp:watcher
 ```
+
+For non-HBAR crypto rails, start the local relay too:
+
+```bash
+npm run atp:relay
+```
+
+### 4) Run the rental test harness
+
+```bash
+npm run atp:test:rental
+```
+
+## Required vs optional dependencies
+
+`npm run atp:doctor` checks both.
+
+### Required
+- Node.js >= 18
+- Docker daemon
+- Docker image `atp-rental`
+- `@hashgraph/sdk`
+- Hedera operator key in macOS Keychain
+- `docker/.env`
+- monitor state files
+
+### Optional, but needed for specific payment rails
+- ChangeNOW API key → crypto rails
+- VAL wallet mnemonic → wallet sends / relay-related flows
+- Coinbase CDP config → cash/card onramp URL generation
+- PayPal credentials → PayPal / Venmo rails
+- rental bot token → Telegram rental UX
+- VAL relay on `localhost:3141` → non-HBAR crypto rails (`npm run atp:relay`)
+
+## Payment-enabled ATP flow
+
+Recent runtime work in this repo includes support for:
+- HBAR funding
+- funding intents as the canonical payment path
+- prefunded hot-wallet handling
+- additional rail selection logic
+- activation through the monitor / watcher flow
+
+That means another agent should be able to clone this repo, satisfy `atp:doctor`, and get the payment-enabled ATP runtime working locally.
+
+## Repository status
+
+This repo is still being cleaned up so the public GitHub state matches the actual ATP codebase.
+The immediate goal is:
+- keep ATP runtime code here
+- remove private workspace material
+- ignore secrets, logs, memory, local state, and generated benchmark output
+- make public install-from-source reproducible
+
+## Related projects
+
+- **ATP GitHub:** <https://github.com/aite550659-max/agent-trust-protocol>
+- **VAL GitHub:** <https://github.com/aite550659-max/verifiable-agent-log>
 
 ## License
 
@@ -104,5 +113,5 @@ Apache 2.0 — Copyright 2026 Gregory L. Bell
 
 ---
 
-**Built by:** Gregg Bell ([@GregoryLBell](https://x.com/GregoryLBell)), Aite ([@TExplorer59](https://x.com/TExplorer59))  
+**Built by:** Gregg Bell ([@GregoryLBell](https://x.com/GregoryLBell)), Aite ([@TExplorer59](https://x.com/TExplorer59))
 **Architecture:** Hedera-Native (no smart contracts)

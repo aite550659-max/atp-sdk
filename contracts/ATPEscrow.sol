@@ -1,397 +1,348 @@
-// SPDX-License-Identifier: Apache-2.0
-pragma solidity ^0.8.20;
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
 
 /**
- * ATP Escrow — Agent Trust Protocol Settlement Contract
- * 
- * Handles escrow deposit, fee split distribution, timeout refunds,
- * and rental state management.
+ * @title ATPEscrow
+ * @notice Agent Trust Protocol — Rental Escrow Contract
+ * @dev Deployed on Hedera EVM. Handles HBAR deposits, rental lifecycle, and settlement.
  *
- * Fee splits (basis points):
- *   Owner:    9200 (92%)
- *   Creator:   500 (5%)
- *   Network:   200 (2%)
- *   Treasury:  100 (1%)
+ * Flow:
+ *   1. Renter deposits HBAR (or HBAR arrives from swap/on-ramp)
+ *   2. Owner starts rental → funds locked
+ *   3. Rental runs → interactions logged to HCS
+ *   4. Rental ends → owner submits final cost → settlement
+ *   5. Owner receives cost, renter receives refund
  *
- * Copyright 2026 Gregory L. Bell. Apache-2.0 License.
+ * All amounts in tinybars (1 HBAR = 100,000,000 tinybars).
+ * HCS topic ID stored for audit trail reference.
  */
-
 contract ATPEscrow {
-    // --- Constants ---
-    uint16 public constant OWNER_BPS = 9200;
-    uint16 public constant CREATOR_BPS = 500;
-    uint16 public constant NETWORK_BPS = 200;
-    uint16 public constant TREASURY_BPS = 100;
-    uint16 public constant TOTAL_BPS = 10000;
 
-    // --- Immutable config ---
-    address payable public networkAddress;
-    address payable public treasuryAddress;
-    address public admin; // protocol admin (timelock upgrade path later)
+    // ── Types ────────────────────────────────────────────────────────────────
 
-    // --- Rental states ---
-    enum RentalStatus { None, Active, Completed, Terminated, TimedOut }
+    enum RentalStatus { None, Deposited, Active, Settled, Disputed, Expired }
 
     struct Rental {
-        string rentalId;
-        address payable renter;
-        address payable owner;
-        address payable creator;
-        uint256 stakeAmount;      // in tinybars (msg.value on Hedera EVM)
-        uint256 bufferAmount;     // in tinybars
-        uint256 totalEscrowed;    // stakeAmount + bufferAmount
-        uint64 startedAt;         // unix timestamp
-        uint64 timeoutAt;         // unix timestamp — renter can claim after this
-        uint64 settlementDeadline; // unix timestamp — owner can still settle until this
+        address renter;
+        address owner;
+        uint256 depositAmount;      // Total deposited (tinybars)
+        uint256 budgetCap;          // Max the owner can claim (tinybars)
+        uint256 finalCost;          // Actual cost at settlement (tinybars)
+        uint256 startTime;
+        uint256 endTime;
+        uint256 maxDuration;        // Max rental duration in seconds
+        string rentalId;            // ATP rental ID (matches HCS logs)
+        string hcsTopicId;          // HCS topic for audit trail
         RentalStatus status;
     }
 
-    // --- Storage ---
+    // ── State ────────────────────────────────────────────────────────────────
+
     mapping(bytes32 => Rental) public rentals;
-    uint256 public rentalCount;
+    mapping(address => bool) public registeredOwners;
 
-    // --- Pull Pattern: Withdrawable Balances ---
-    // Hedera EVM cannot push HBAR via .call{value}(). 
-    // Instead, we credit balances and let recipients withdraw.
-    mapping(address => uint256) public withdrawable;
+    address public admin;
+    uint256 public protocolFeeBps;   // Fee in basis points (100 = 1%)
+    address public feeRecipient;
+    uint256 public minDeposit;       // Minimum deposit (tinybars)
+    uint256 public totalSettled;     // Lifetime settled amount
+    uint256 public totalFees;        // Lifetime protocol fees
 
-    // --- Events ---
-    event RentalInitiated(
-        bytes32 indexed rentalHash,
-        string rentalId,
-        address indexed renter,
-        address indexed owner,
-        address creator,
-        uint256 totalEscrowed,
-        uint64 timeoutAt
-    );
+    // ── Events ───────────────────────────────────────────────────────────────
 
-    event RentalCompleted(
-        bytes32 indexed rentalHash,
-        uint256 ownerPayout,
-        uint256 creatorPayout,
-        uint256 networkPayout,
-        uint256 treasuryPayout,
-        uint256 renterRefund
-    );
+    event OwnerRegistered(address indexed owner);
+    event OwnerRemoved(address indexed owner);
+    event RentalDeposited(bytes32 indexed rentalHash, string rentalId, address indexed renter, address indexed owner, uint256 amount);
+    event RentalStarted(bytes32 indexed rentalHash, string rentalId, uint256 startTime);
+    event RentalSettled(bytes32 indexed rentalHash, string rentalId, uint256 ownerPayout, uint256 renterRefund, uint256 protocolFee);
+    event RentalDisputed(bytes32 indexed rentalHash, string rentalId, address disputedBy);
+    event RentalExpired(bytes32 indexed rentalHash, string rentalId);
+    event FundsWithdrawn(address indexed to, uint256 amount);
 
-    event RentalTerminated(
-        bytes32 indexed rentalHash,
-        address terminatedBy,
-        uint256 chargedAmount,
-        uint256 renterRefund
-    );
+    // ── Modifiers ────────────────────────────────────────────────────────────
 
-    event RentalTimeoutClaimed(
-        bytes32 indexed rentalHash,
-        address indexed renter,
-        uint256 refundAmount
-    );
-
-    event BalanceCredited(
-        address indexed recipient,
-        uint256 amount,
-        bytes32 indexed rentalHash
-    );
-
-    event Withdrawn(
-        address indexed recipient,
-        uint256 amount
-    );
-
-    // --- Modifiers ---
     modifier onlyAdmin() {
-        require(msg.sender == admin, "ATP: not admin");
+        require(msg.sender == admin, "Not admin");
         _;
     }
 
-    modifier onlyRenter(bytes32 rentalHash) {
-        require(msg.sender == rentals[rentalHash].renter, "ATP: not renter");
+    modifier onlyRegisteredOwner() {
+        require(registeredOwners[msg.sender], "Not registered owner");
         _;
     }
 
-    modifier onlyOwner(bytes32 rentalHash) {
-        require(msg.sender == rentals[rentalHash].owner, "ATP: not owner");
-        _;
-    }
+    // ── Constructor ──────────────────────────────────────────────────────────
 
-    modifier onlyActive(bytes32 rentalHash) {
-        require(rentals[rentalHash].status == RentalStatus.Active, "ATP: rental not active");
-        _;
-    }
-
-    // --- Constructor ---
-    constructor(address payable _networkAddress, address payable _treasuryAddress) {
-        require(_networkAddress != address(0), "ATP: zero network address");
-        require(_treasuryAddress != address(0), "ATP: zero treasury address");
-        networkAddress = _networkAddress;
-        treasuryAddress = _treasuryAddress;
+    constructor(uint256 _protocolFeeBps, uint256 _minDeposit) {
+        require(_protocolFeeBps <= 1000, "Fee too high"); // Max 10%
         admin = msg.sender;
+        feeRecipient = msg.sender;
+        protocolFeeBps = _protocolFeeBps;
+        minDeposit = _minDeposit;
     }
 
-    // --- Core Functions ---
+    // ── Owner Registration ───────────────────────────────────────────────────
+
+    function registerOwner(address owner) external onlyAdmin {
+        registeredOwners[owner] = true;
+        emit OwnerRegistered(owner);
+    }
+
+    function removeOwner(address owner) external onlyAdmin {
+        registeredOwners[owner] = false;
+        emit OwnerRemoved(owner);
+    }
+
+    // ── Rental Lifecycle ─────────────────────────────────────────────────────
 
     /**
-     * Initiate a rental. Renter deposits stake + buffer.
-     * @param rentalId Unique rental identifier
-     * @param owner Agent owner address
-     * @param creator Agent creator address (receives royalty)
-     * @param stakeAmount Stake portion in tinybars
-     * @param timeoutAt Unix timestamp when renter can claim timeout refund
-     * @param settlementDeadline Unix timestamp when owner settlement window closes
+     * @notice Renter deposits HBAR to initiate a rental
+     * @param rentalId ATP rental ID (links to HCS audit trail)
+     * @param owner Agent owner's address
+     * @param budgetCap Maximum cost in tinybars (renter's price ceiling)
+     * @param maxDuration Maximum rental duration in seconds
+     * @param hcsTopicId HCS topic ID for audit trail
      */
-    function initiate(
+    function deposit(
         string calldata rentalId,
-        address payable owner,
-        address payable creator,
-        uint256 stakeAmount,
-        uint64 timeoutAt,
-        uint64 settlementDeadline
+        address owner,
+        uint256 budgetCap,
+        uint256 maxDuration,
+        string calldata hcsTopicId
     ) external payable {
-        require(msg.value > 0, "ATP: zero escrow");
-        require(owner != address(0), "ATP: zero owner");
-        require(creator != address(0), "ATP: zero creator");
-        require(stakeAmount <= msg.value, "ATP: stake exceeds deposit");
-        require(timeoutAt > block.timestamp, "ATP: timeout in past");
-        require(settlementDeadline > timeoutAt, "ATP: deadline before timeout");
+        require(msg.value >= minDeposit, "Below minimum deposit");
+        require(msg.value >= budgetCap, "Deposit must cover budget cap");
+        require(registeredOwners[owner], "Owner not registered");
+        require(maxDuration > 0 && maxDuration <= 86400, "Duration: 1s-24h");
 
         bytes32 rentalHash = keccak256(abi.encodePacked(rentalId));
-        require(rentals[rentalHash].status == RentalStatus.None, "ATP: rental exists");
+        require(rentals[rentalHash].status == RentalStatus.None, "Rental ID exists");
 
         rentals[rentalHash] = Rental({
-            rentalId: rentalId,
-            renter: payable(msg.sender),
+            renter: msg.sender,
             owner: owner,
-            creator: creator,
-            stakeAmount: stakeAmount,
-            bufferAmount: msg.value - stakeAmount,
-            totalEscrowed: msg.value,
-            startedAt: uint64(block.timestamp),
-            timeoutAt: timeoutAt,
-            settlementDeadline: settlementDeadline,
-            status: RentalStatus.Active
+            depositAmount: msg.value,
+            budgetCap: budgetCap,
+            finalCost: 0,
+            startTime: 0,
+            endTime: 0,
+            maxDuration: maxDuration,
+            rentalId: rentalId,
+            hcsTopicId: hcsTopicId,
+            status: RentalStatus.Deposited
         });
 
-        rentalCount++;
-
-        emit RentalInitiated(
-            rentalHash,
-            rentalId,
-            msg.sender,
-            owner,
-            creator,
-            msg.value,
-            timeoutAt
-        );
+        emit RentalDeposited(rentalHash, rentalId, msg.sender, owner, msg.value);
     }
 
     /**
-     * Complete a rental with usage settlement.
-     * Callable by owner or admin.
-     * @param rentalHash Hash of the rental ID
-     * @param usageAmount Amount consumed from buffer (in tinybars)
+     * @notice Owner starts the rental (activates the session)
+     * @param rentalId ATP rental ID
      */
-    function complete(
-        bytes32 rentalHash,
-        uint256 usageAmount
-    ) external onlyActive(rentalHash) {
+    function startRental(string calldata rentalId) external onlyRegisteredOwner {
+        bytes32 rentalHash = keccak256(abi.encodePacked(rentalId));
         Rental storage rental = rentals[rentalHash];
-        require(
-            msg.sender == rental.owner || msg.sender == admin,
-            "ATP: not owner or admin"
-        );
 
-        // If past timeout, must be within settlement deadline
-        if (block.timestamp > rental.timeoutAt) {
-            require(
-                block.timestamp <= rental.settlementDeadline,
-                "ATP: settlement deadline passed"
-            );
+        require(rental.status == RentalStatus.Deposited, "Not in deposited state");
+        require(rental.owner == msg.sender, "Not the rental owner");
+
+        rental.status = RentalStatus.Active;
+        rental.startTime = block.timestamp;
+
+        emit RentalStarted(rentalHash, rentalId, block.timestamp);
+    }
+
+    /**
+     * @notice Settle a rental — owner submits final cost, funds distributed
+     * @param rentalId ATP rental ID
+     * @param finalCost Actual cost in tinybars (must be <= budgetCap)
+     */
+    function settle(string calldata rentalId, uint256 finalCost) external {
+        bytes32 rentalHash = keccak256(abi.encodePacked(rentalId));
+        Rental storage rental = rentals[rentalHash];
+
+        require(rental.status == RentalStatus.Active, "Not active");
+        require(
+            msg.sender == rental.owner || msg.sender == rental.renter,
+            "Not owner or renter"
+        );
+        require(finalCost <= rental.budgetCap, "Exceeds budget cap");
+        require(finalCost <= rental.depositAmount, "Exceeds deposit");
+
+        rental.finalCost = finalCost;
+        rental.endTime = block.timestamp;
+        rental.status = RentalStatus.Settled;
+
+        // Calculate splits
+        uint256 protocolFee = (finalCost * protocolFeeBps) / 10000;
+        uint256 ownerPayout = finalCost - protocolFee;
+        uint256 renterRefund = rental.depositAmount - finalCost;
+
+        // Transfer
+        if (ownerPayout > 0) {
+            (bool s1,) = rental.owner.call{value: ownerPayout}("");
+            require(s1, "Owner transfer failed");
+        }
+        if (renterRefund > 0) {
+            (bool s2,) = rental.renter.call{value: renterRefund}("");
+            require(s2, "Renter refund failed");
+        }
+        if (protocolFee > 0) {
+            (bool s3,) = feeRecipient.call{value: protocolFee}("");
+            require(s3, "Fee transfer failed");
         }
 
-        // Cap usage to buffer
-        uint256 charged = usageAmount > rental.bufferAmount ? rental.bufferAmount : usageAmount;
+        totalSettled += finalCost;
+        totalFees += protocolFee;
 
-        _settle(rentalHash, charged, RentalStatus.Completed);
+        emit RentalSettled(rentalHash, rentalId, ownerPayout, renterRefund, protocolFee);
     }
 
     /**
-     * Terminate a rental early. Callable by renter or owner.
-     * Charges base fee only (minimum usage).
-     * @param rentalHash Hash of the rental ID
-     * @param baseFeeAmount Base fee to charge (in tinybars)
+     * @notice Expire a rental that exceeded max duration — anyone can call
+     * @param rentalId ATP rental ID
      */
-    function terminate(
-        bytes32 rentalHash,
-        uint256 baseFeeAmount
-    ) external onlyActive(rentalHash) {
+    function expire(string calldata rentalId) external {
+        bytes32 rentalHash = keccak256(abi.encodePacked(rentalId));
         Rental storage rental = rentals[rentalHash];
+
+        require(rental.status == RentalStatus.Active, "Not active");
         require(
-            msg.sender == rental.renter || msg.sender == rental.owner,
-            "ATP: not renter or owner"
+            block.timestamp > rental.startTime + rental.maxDuration,
+            "Not yet expired"
         );
 
-        uint256 charged = baseFeeAmount > rental.bufferAmount ? rental.bufferAmount : baseFeeAmount;
+        rental.endTime = block.timestamp;
+        rental.status = RentalStatus.Expired;
 
-        _settle(rentalHash, charged, RentalStatus.Terminated);
+        // On expiry: owner gets budget cap, renter gets remainder
+        uint256 ownerPayout = rental.budgetCap;
+        uint256 protocolFee = (ownerPayout * protocolFeeBps) / 10000;
+        ownerPayout -= protocolFee;
+        uint256 renterRefund = rental.depositAmount - rental.budgetCap;
 
-        emit RentalTerminated(
-            rentalHash,
-            msg.sender,
-            charged,
-            rental.stakeAmount + (rental.bufferAmount - charged)
-        );
-    }
-
-    /**
-     * Claim timeout refund as renter.
-     * Available after timeoutAt, returns full escrow minus minimal protocol fees.
-     * Credits renter's withdrawable balance; minimal fees credited to network/treasury.
-     * @param rentalHash Hash of the rental ID
-     */
-    function claimTimeout(
-        bytes32 rentalHash
-    ) external onlyActive(rentalHash) onlyRenter(rentalHash) {
-        Rental storage rental = rentals[rentalHash];
-        require(block.timestamp > rental.timeoutAt, "ATP: not timed out yet");
-
-        // Minimal fee: network + treasury on buffer only
-        uint256 minFeeAmount = (rental.bufferAmount * (NETWORK_BPS + TREASURY_BPS)) / TOTAL_BPS;
-        uint256 networkFee = (minFeeAmount * NETWORK_BPS) / (NETWORK_BPS + TREASURY_BPS);
-        uint256 treasuryFee = minFeeAmount - networkFee;
-        uint256 renterRefund = rental.totalEscrowed - networkFee - treasuryFee;
-
-        rental.status = RentalStatus.TimedOut;
-
-        // Credit balances (pull pattern)
-        _credit(networkAddress, networkFee, rentalHash);
-        _credit(treasuryAddress, treasuryFee, rentalHash);
-        _credit(rental.renter, renterRefund, rentalHash);
-
-        emit RentalTimeoutClaimed(rentalHash, rental.renter, renterRefund);
-    }
-
-    // --- Internal ---
-
-    /**
-     * Execute settlement: distribute charged amount per fee splits,
-     * return stake + unused buffer to renter.
-     *
-     * PULL PATTERN: All amounts are credited to withdrawable balances.
-     * Recipients call withdraw() to claim their HBAR.
-     * This avoids Hedera EVM limitations with .call{value}() transfers
-     * and prevents reentrancy attacks.
-     */
-    function _settle(
-        bytes32 rentalHash,
-        uint256 chargedAmount,
-        RentalStatus newStatus
-    ) internal {
-        Rental storage rental = rentals[rentalHash];
-
-        // Calculate splits on charged amount
-        uint256 ownerPayout = (chargedAmount * OWNER_BPS) / TOTAL_BPS;
-        uint256 creatorPayout = (chargedAmount * CREATOR_BPS) / TOTAL_BPS;
-        uint256 networkPayout = (chargedAmount * NETWORK_BPS) / TOTAL_BPS;
-        uint256 treasuryPayout = chargedAmount - ownerPayout - creatorPayout - networkPayout; // absorb dust
-
-        // Renter gets stake + unused buffer
-        uint256 renterRefund = rental.totalEscrowed - chargedAmount;
-
-        rental.status = newStatus;
-
-        // Credit all balances (pull pattern — no push transfers)
-        _credit(rental.owner, ownerPayout, rentalHash);
-        _credit(rental.creator, creatorPayout, rentalHash);
-        _credit(networkAddress, networkPayout, rentalHash);
-        _credit(treasuryAddress, treasuryPayout, rentalHash);
-        _credit(rental.renter, renterRefund, rentalHash);
-
-        emit RentalCompleted(
-            rentalHash,
-            ownerPayout,
-            creatorPayout,
-            networkPayout,
-            treasuryPayout,
-            renterRefund
-        );
-    }
-
-    /**
-     * Credit an amount to a recipient's withdrawable balance.
-     */
-    function _credit(address recipient, uint256 amount, bytes32 rentalHash) internal {
-        if (amount > 0) {
-            withdrawable[recipient] += amount;
-            emit BalanceCredited(recipient, amount, rentalHash);
+        if (ownerPayout > 0) {
+            (bool s1,) = rental.owner.call{value: ownerPayout}("");
+            require(s1, "Owner transfer failed");
         }
+        if (renterRefund > 0) {
+            (bool s2,) = rental.renter.call{value: renterRefund}("");
+            require(s2, "Renter refund failed");
+        }
+        if (protocolFee > 0) {
+            (bool s3,) = feeRecipient.call{value: protocolFee}("");
+            require(s3, "Fee transfer failed");
+        }
+
+        totalSettled += rental.budgetCap;
+        totalFees += protocolFee;
+
+        emit RentalExpired(rentalHash, rentalId);
     }
 
     /**
-     * Withdraw all credited balance. Callable by anyone with a balance.
-     * Uses checks-effects-interactions pattern to prevent reentrancy.
+     * @notice Dispute a rental — freezes funds pending resolution
+     * @param rentalId ATP rental ID
      */
-    function withdraw() external {
-        uint256 amount = withdrawable[msg.sender];
-        require(amount > 0, "ATP: nothing to withdraw");
+    function dispute(string calldata rentalId) external {
+        bytes32 rentalHash = keccak256(abi.encodePacked(rentalId));
+        Rental storage rental = rentals[rentalHash];
 
-        // Effects before interactions (reentrancy safe)
-        withdrawable[msg.sender] = 0;
+        require(rental.status == RentalStatus.Active, "Not active");
+        require(
+            msg.sender == rental.owner || msg.sender == rental.renter,
+            "Not owner or renter"
+        );
 
-        // Transfer HBAR to caller
-        (bool success, ) = payable(msg.sender).call{value: amount}("");
-        require(success, "ATP: withdrawal failed");
-
-        emit Withdrawn(msg.sender, amount);
+        rental.status = RentalStatus.Disputed;
+        emit RentalDisputed(rentalHash, rentalId, msg.sender);
     }
 
     /**
-     * Admin can withdraw on behalf of system accounts (e.g., 0.0.800)
-     * that cannot call withdraw() themselves.
-     * Funds are sent to admin; admin handles forwarding via Hedera SDK.
+     * @notice Admin resolves a dispute
+     * @param rentalId ATP rental ID
+     * @param ownerAmount Amount to send to owner
+     * @param renterAmount Amount to refund to renter
      */
-    function withdrawFor(address account) external onlyAdmin {
-        uint256 amount = withdrawable[account];
-        require(amount > 0, "ATP: nothing to withdraw");
+    function resolveDispute(
+        string calldata rentalId,
+        uint256 ownerAmount,
+        uint256 renterAmount
+    ) external onlyAdmin {
+        bytes32 rentalHash = keccak256(abi.encodePacked(rentalId));
+        Rental storage rental = rentals[rentalHash];
 
-        withdrawable[account] = 0;
+        require(rental.status == RentalStatus.Disputed, "Not disputed");
+        require(ownerAmount + renterAmount <= rental.depositAmount, "Exceeds deposit");
 
-        (bool success, ) = payable(admin).call{value: amount}("");
-        require(success, "ATP: withdrawal failed");
+        rental.status = RentalStatus.Settled;
+        rental.endTime = block.timestamp;
+        rental.finalCost = ownerAmount;
 
-        emit Withdrawn(account, amount);
+        if (ownerAmount > 0) {
+            (bool s1,) = rental.owner.call{value: ownerAmount}("");
+            require(s1, "Owner transfer failed");
+        }
+        if (renterAmount > 0) {
+            (bool s2,) = rental.renter.call{value: renterAmount}("");
+            require(s2, "Renter refund failed");
+        }
+
+        // Any remainder (e.g., rounding) goes to protocol
+        uint256 remainder = rental.depositAmount - ownerAmount - renterAmount;
+        if (remainder > 0) {
+            (bool s3,) = feeRecipient.call{value: remainder}("");
+            require(s3, "Remainder transfer failed");
+        }
+
+        totalSettled += ownerAmount;
     }
 
-    // --- View Functions ---
+    // ── View Functions ───────────────────────────────────────────────────────
 
-    function getRental(bytes32 rentalHash) external view returns (Rental memory) {
+    function getRental(string calldata rentalId) external view returns (Rental memory) {
+        bytes32 rentalHash = keccak256(abi.encodePacked(rentalId));
         return rentals[rentalHash];
     }
 
-    function getRentalHash(string calldata rentalId) external pure returns (bytes32) {
-        return keccak256(abi.encodePacked(rentalId));
+    function getRentalStatus(string calldata rentalId) external view returns (RentalStatus) {
+        bytes32 rentalHash = keccak256(abi.encodePacked(rentalId));
+        return rentals[rentalHash].status;
     }
 
-    function isTimedOut(bytes32 rentalHash) external view returns (bool) {
+    function isExpired(string calldata rentalId) external view returns (bool) {
+        bytes32 rentalHash = keccak256(abi.encodePacked(rentalId));
         Rental storage rental = rentals[rentalHash];
-        return rental.status == RentalStatus.Active && block.timestamp > rental.timeoutAt;
+        if (rental.status != RentalStatus.Active) return false;
+        return block.timestamp > rental.startTime + rental.maxDuration;
     }
 
-    function isInSettlementWindow(bytes32 rentalHash) external view returns (bool) {
-        Rental storage rental = rentals[rentalHash];
-        return rental.status == RentalStatus.Active 
-            && block.timestamp > rental.timeoutAt 
-            && block.timestamp <= rental.settlementDeadline;
+    // ── Admin Functions ──────────────────────────────────────────────────────
+
+    function setProtocolFee(uint256 _feeBps) external onlyAdmin {
+        require(_feeBps <= 1000, "Fee too high");
+        protocolFeeBps = _feeBps;
     }
 
-    // --- Admin ---
+    function setFeeRecipient(address _recipient) external onlyAdmin {
+        require(_recipient != address(0), "Zero address");
+        feeRecipient = _recipient;
+    }
 
-    function updateAdmin(address newAdmin) external onlyAdmin {
-        require(newAdmin != address(0), "ATP: zero admin");
+    function setMinDeposit(uint256 _minDeposit) external onlyAdmin {
+        minDeposit = _minDeposit;
+    }
+
+    function transferAdmin(address newAdmin) external onlyAdmin {
+        require(newAdmin != address(0), "Zero address");
         admin = newAdmin;
     }
 
-    // Allow contract to receive HBAR
-    receive() external payable {}
-    fallback() external payable {}
+    // Emergency withdrawal (admin only, for stuck funds)
+    function emergencyWithdraw(address to, uint256 amount) external onlyAdmin {
+        require(to != address(0), "Zero address");
+        (bool success,) = to.call{value: amount}("");
+        require(success, "Transfer failed");
+        emit FundsWithdrawn(to, amount);
+    }
 }

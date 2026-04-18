@@ -1,10 +1,10 @@
 # ATP HCS Message Schema v2.1
 
-**Purpose:** Complete specification of all HCS message types for ATP protocol  
-**Topic:** Single topic per agent (e.g., 0.0.10261370)  
-**Format:** JSON, UTF-8 encoded  
-**Version:** 2.1 (Hedera-Native Architecture)  
-**Last Updated:** March 10, 2026  
+**Purpose:** Complete specification of all HCS message types for ATP protocol
+**Topic:** Single topic per agent (e.g., 0.0.10261370)
+**Format:** JSON, UTF-8 encoded
+**Version:** 2.1 (Hedera-Native Architecture)
+**Last Updated:** March 10, 2026
 **Changelog v2.1:**
 - `agent_created` payload: added `did`, `registration_uri`, `a2a_endpoint` fields
 - `rental_initiated` constraints: added `enforcement` field (self_declared|audited|sdk|tee)
@@ -431,8 +431,8 @@ See `@agent-trust-protocol/sdk` for Node.js implementation of:
 
 ---
 
-**Document Version:** 2.1  
-**Last Updated:** March 10, 2026  
+**Document Version:** 2.1
+**Last Updated:** March 10, 2026
 **Status:** Draft
 
 For questions, contributions, or implementations: [github.com/aite550659-max/verifiable-agent-log](https://github.com/aite550659-max/verifiable-agent-log)

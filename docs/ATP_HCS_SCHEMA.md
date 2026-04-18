@@ -2,7 +2,7 @@
 
 *Standardized message formats for Agent Trust Protocol audit trails*
 
-**Version:** 0.1  
+**Version:** 0.1
 **Last Updated:** February 6, 2026
 
 ---
@@ -410,10 +410,10 @@ async function logToHCS(topicId, message) {
     const tx = new TopicMessageSubmitTransaction()
         .setTopicId(topicId)
         .setMessage(JSON.stringify(message));
-    
+
     const response = await tx.execute(client);
     const receipt = await response.getReceipt(client);
-    
+
     return receipt.topicSequenceNumber;
 }
 ```

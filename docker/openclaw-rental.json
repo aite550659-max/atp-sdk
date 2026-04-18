@@ -1,0 +1,66 @@
+{
+  "auth": {
+    "profiles": {
+      "anthropic:default": {
+        "provider": "anthropic",
+        "mode": "api_key"
+      },
+      "openai:default": {
+        "provider": "openai",
+        "mode": "api_key"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "__INJECTED_AT_RUNTIME__"
+      },
+      "workspace": "/home/rental/.openclaw/workspace",
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "maxConcurrent": 2
+    },
+    "list": []
+  },
+  "tools": {
+    "web": {
+      "search": {
+        "enabled": true,
+        "apiKey": "__INJECTED_AT_RUNTIME__"
+      },
+      "fetch": {
+        "enabled": true
+      }
+    }
+  },
+  "bindings": [],
+  "channels": {
+    "telegram": {
+      "enabled": false,
+      "botToken": "",
+      "dmPolicy": "disabled",
+      "allowFrom": [],
+      "groupPolicy": "disabled",
+      "groups": {},
+      "streamMode": "partial"
+    }
+  },
+  "gateway": {
+    "port": 18790,
+    "mode": "local",
+    "bind": "lan",
+    "auth": {
+      "mode": "token",
+      "token": "__INJECTED_AT_RUNTIME__"
+    }
+  },
+  "plugins": {
+    "entries": {
+      "telegram": {
+        "enabled": false
+      }
+    }
+  }
+}

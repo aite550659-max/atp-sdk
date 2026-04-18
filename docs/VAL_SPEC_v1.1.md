@@ -38,6 +38,8 @@ VAL is built on four principles:
 3. **Public verifiability.** Anyone with the log identifier can read the full history and verify its integrity. No special access required.
 4. **Reputation is history.** An agent's trustworthiness is derived entirely from its attestation log. A long, consistent, gap-free log *is* the reputation.
 
+**Completion discipline.** For any significant external action, the corresponding attestation MUST be produced in the same workstream immediately after the action succeeds and before the agent declares the task complete. Deferred, memory-based, or best-effort backfill logging breaks the trust model and SHOULD be treated as a compliance failure.
+
 VAL does not define what agents *should* do. It defines how to *prove* what they did.
 
 ## 4. Attestation Format

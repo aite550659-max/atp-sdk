@@ -34,6 +34,11 @@ describe('Parser', () => {
       expect(classifyMessageType(data)).toBe('OPENCLAW_ACTION');
     });
 
+    it('should classify message_type ATP envelopes', () => {
+      const data = { atp_version: '2.1', message_type: 'rental_completed' };
+      expect(classifyMessageType(data)).toBe('rental_completed');
+    });
+
     it('should classify agent_comms from structure', () => {
       const data = { from: 'agent1', text: 'hello', timestamp: '2026-01-01' };
       expect(classifyMessageType(data)).toBe('agent_comms');
@@ -90,6 +95,29 @@ describe('Parser', () => {
       expect(result).toBeTruthy();
     });
 
+    it('should validate a v2.1 rental_completed envelope by normalizing it', () => {
+      const data = {
+        atp_version: '2.1',
+        message_type: 'rental_completed',
+        agent_id: 'did:hedera:mainnet:test_0.0.123',
+        timestamp: '2026-03-10T15:00:00.123Z',
+        payload: {
+          rental_id: 'rental_abc123',
+          total_cost_usd: 12.5,
+          settlement: {
+            owner: 10,
+            creator: 1,
+            network: 1,
+            treasury: 0.5,
+          },
+        },
+      };
+      const result = validateMessage(data);
+      expect(result).toBeTruthy();
+      expect(result?.type).toBe('rental_completed');
+      expect((result as any)?.rentalId).toBe('rental_abc123');
+    });
+
     it('should return null for invalid message', () => {
       const data = { invalid: 'message' };
       const result = validateMessage(data);
@@ -123,6 +151,38 @@ describe('Parser', () => {
       expect(result.messageType).toBe('AGENT_INITIALIZATION');
       expect(result.validated).toBeTruthy();
       expect(result.error).toBeUndefined();
+    });
+
+    it('should parse a current ATP envelope and return normalized validated output', () => {
+      const messageData = {
+        atp_version: '2.1',
+        message_type: 'rental_initiated',
+        agent_id: 'did:hedera:mainnet:test_0.0.123',
+        timestamp: '2026-03-10T15:00:00.123Z',
+        payload: {
+          rental_id: 'rental_abc123',
+          renter: '0.0.333333',
+          stake_usd: 50,
+          usage_buffer_usd: 100,
+          escrow_account: '0.0.888888',
+        },
+      };
+      const base64 = Buffer.from(JSON.stringify(messageData)).toString('base64');
+      const mirrorMessage: MirrorNodeMessage = {
+        consensus_timestamp: '1234567890.000000000',
+        topic_id: '0.0.123',
+        message: base64,
+        payer_account_id: '0.0.456',
+        sequence_number: 1,
+        running_hash: 'hash',
+        running_hash_version: 3,
+      };
+
+      const result = parseMessage(mirrorMessage);
+      expect(result.messageType).toBe('rental_initiated');
+      expect(result.validated).toBeTruthy();
+      expect((result.validated as any)?.type).toBe('rental_initiated');
+      expect((result.validated as any)?.rentalId).toBe('rental_abc123');
     });
 
     it('should handle invalid base64', () => {
